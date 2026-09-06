@@ -12,6 +12,7 @@ from fastapi import APIRouter, Body, File, HTTPException, UploadFile
 from pydantic import BaseModel
 from fastapi.responses import FileResponse
 
+from app.core.storage import resolve_attachment_path
 from app.db.sqlite import to_utc_isoformat
 from app.models import AnalysisCreate, PaperCreate, PaperDetailResponse, PaperResponse, PaperUpdate, SearchResultItem, SearchResultResponse
 from app.services import (
@@ -302,7 +303,7 @@ def get_attachment_file_api(paper_id: str, attachment_type: str):
     if attachment is None:
         raise HTTPException(status_code=404, detail="Attachment not found")
 
-    file_path = Path(attachment.file_path)
+    file_path = resolve_attachment_path(paper_id, attachment.file_path)
     if not file_path.exists():
         raise HTTPException(status_code=404, detail="File not found")
 
@@ -381,7 +382,7 @@ def reanalyze_paper_api(paper_id: str, force_mineru_refresh: bool = False) -> di
         try:
             auto_parse_and_analyze(
                 paper_id,
-                original.file_path,
+                str(resolve_attachment_path(paper_id, original.file_path)),
                 force_mineru_refresh=force_mineru_refresh,
             )
         except Exception:
@@ -518,7 +519,7 @@ def _get_pdf_path_for_mineru(paper_id: str) -> Optional[Path]:
     if original is None:
         return None
 
-    pdf_path = Path(original.file_path)
+    pdf_path = resolve_attachment_path(paper_id, original.file_path)
     if not pdf_path.exists():
         return None
 

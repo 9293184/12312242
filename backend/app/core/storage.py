@@ -28,6 +28,20 @@ def paper_storage_relative_dir(paper_id: str) -> str:
     return f"storage/{paper_id}"
 
 
+def resolve_attachment_path(paper_id: str, stored_path: str) -> Path:
+    """Resolve an attachment's stored path, tolerating restores on a new machine.
+
+    The DB keeps absolute file paths, so a full backup restored to a different
+    workspace location (or machine) carries stale paths. Files always land in
+    the canonical ``workspace/storage/<paper_id>/`` layout, so fall back to the
+    same file name there when the stored path no longer exists.
+    """
+    path = Path(stored_path)
+    if path.exists():
+        return path
+    return settings.workspace_dir / "storage" / paper_id / path.name
+
+
 def store_attachment_file(paper_id: str, attachment_type: str, source_path: str) -> tuple[Path, int]:
     src = Path(source_path)
     if not src.exists():

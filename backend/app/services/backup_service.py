@@ -30,6 +30,7 @@ from pathlib import Path
 from typing import Iterable
 
 from app.core.config import settings
+from app.core.storage import resolve_attachment_path
 from app.db import session
 from app.services.api_config import CONFIG_FILE
 
@@ -318,6 +319,72 @@ def _resolve_restore_target(arcname: str) -> Path | None:
     return settings.workspace_dir / normalized
 
 
+def _reanchor_attachment_paths() -> int:
+    """Rewrite stale absolute attachment paths after a restore.
+
+    A backup made on another machine stores absolute file paths under that
+    machine's workspace. After a restore the files land in the current
+    workspace's canonical layout, so re-point rows whose stored path no
+    longer resolves to an existing file.
+    """
+    updated = 0
+    with session() as conn:
+        rows = conn.execute("SELECT id, paper_id, file_path FROM attachments").fetchall()
+        for row in rows:
+            resolved = resolve_attachment_path(row["paper_id"], row["file_path"])
+            if resolved.exists() and str(resolved) != row["file_path"]:
+                conn.execute(
+                    "UPDATE attachments SET file_path = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                    (str(resolved), row["id"]),
+                )
+                updated += 1
+    if updated:
+        logger.info("restore_reanchored_attachment_paths count=%s", updated)
+    return updated
+
+
+def _reanchor_markdown_paths() -> int:
+    """Rewrite stale MinerU markdown paths inside paper_texts.sections_json.
+
+    sections_json embeds absolute paths (top-level ``markdown_path`` and the
+    nested MinerU result). Re-root any stale ``/Users/.../workspace/`` prefix
+    onto the current workspace when the referenced file exists there.
+    """
+    current_prefix = str(settings.workspace_dir) + "/"
+    stale_prefix_re = re.compile(r"/Users/[^\"\\\s]*/workspace/")
+    updated = 0
+    with session() as conn:
+        rows = conn.execute(
+            "SELECT id, sections_json FROM paper_texts WHERE sections_json LIKE '%markdown_path%'"
+        ).fetchall()
+        for row in rows:
+            raw = row["sections_json"] or ""
+            prefixes = set(stale_prefix_re.findall(raw))
+            rewritten = raw
+            changed = False
+            for prefix in prefixes:
+                if prefix == current_prefix:
+                    continue
+                candidate = rewritten.replace(prefix, current_prefix)
+                try:
+                    payload = json.loads(candidate)
+                except json.JSONDecodeError:
+                    continue
+                md_path = str(payload.get("markdown_path", "") or "")
+                if md_path and Path(md_path).exists():
+                    rewritten = candidate
+                    changed = True
+            if changed:
+                conn.execute(
+                    "UPDATE paper_texts SET sections_json = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                    (rewritten, row["id"]),
+                )
+                updated += 1
+    if updated:
+        logger.info("restore_reanchored_markdown_paths count=%s", updated)
+    return updated
+
+
 def restore_full_backup(zip_bytes: bytes) -> dict:
     """Validate and apply a full backup ZIP to the current workspace.
 
@@ -360,10 +427,16 @@ def restore_full_backup(zip_bytes: bytes) -> dict:
     except Exception as exc:  # pragma: no cover - defensive
         logger.warning("settings_reset_after_restore_failed error=%s", exc)
 
+    # The restored DB may carry absolute paths from the backup's original
+    # machine; re-point them at the current workspace where possible.
+    reanchored = _reanchor_attachment_paths()
+    reanchored += _reanchor_markdown_paths()
+
     summary = {
         "restored_files": restored_files,
         "restored_size_bytes": restored_bytes,
         "restored_size_display": _format_size(restored_bytes),
+        "reanchored_attachment_paths": reanchored,
         "backup_created_at": manifest.get("created_at", ""),
         "workspace_path": str(workspace),
     }

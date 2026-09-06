@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 from app.api.v1 import api_router
@@ -42,3 +44,31 @@ def on_startup() -> None:
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
+
+
+# ===== 可选：由后端直接托管前端构建产物（SPA）=====
+# 若 frontend/dist 目录存在（生产部署、或本地已 npm run build），后端同时托管前端：
+#   1. 已注册的 /api/v1/*、/health、/workspace/* 路由优先匹配，不受影响；
+#   2. 存在的静态文件（/assets/*、/icon.png、/poem.md 等）直接返回；
+#   3. 其余 GET 路径（BrowserRouter 深链接，如 /papers/<id> 直接打开/刷新）
+#      一律回退到 index.html，由前端路由接管，避免 404。
+# 前后端分离开发（vite dev server）时 dist 即使存在也不影响 /api。
+# 可用环境变量 FRONTEND_DIST_DIR 显式指定产物目录。
+_default_dist_dir = Path(__file__).resolve().parents[2] / "frontend" / "dist"
+FRONTEND_DIST = Path(os.getenv("FRONTEND_DIST_DIR", str(_default_dist_dir))).expanduser().resolve()
+
+if FRONTEND_DIST.is_dir():
+    @app.get("/{full_path:path}", include_in_schema=False)
+    def spa_catch_all(full_path: str, request: Request) -> Response:
+        if request.method != "GET":
+            return Response(status_code=405)
+        # 防目录穿越：解析后的文件必须仍在 dist 目录内
+        candidate = (FRONTEND_DIST / full_path).resolve()
+        try:
+            candidate.relative_to(FRONTEND_DIST)
+        except ValueError:
+            return Response(status_code=404)
+        if full_path and candidate.is_file():
+            return FileResponse(candidate)
+        # 未知路径 → SPA 入口（深链接由前端 BrowserRouter 处理）
+        return FileResponse(FRONTEND_DIST / "index.html")

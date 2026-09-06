@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 from app.core.analysis import build_analysis_payload, build_metadata_payload
 from app.core.debug_log import append_debug_record, clear_task_logs, log_task_event, log_task_update, task_log_timer
 from app.core.pdf_parser import extract_pdf_text, extract_text_from_markdown
-from app.core.storage import store_attachment_file
+from app.core.storage import resolve_attachment_path, store_attachment_file
 from app.db import session
 from app.db.sqlite import to_utc_isoformat
 from app.models import AnalysisCreate, MetadataCreate, PaperCreate, PaperDetailResponse, PaperUpdate
@@ -980,7 +980,7 @@ def delete_attachment_file(paper_id: str, attachment_type: str) -> bool:
         row = conn.execute("SELECT file_path FROM attachments WHERE paper_id = ? AND attachment_type = ?", (paper_id, attachment_type)).fetchone()
         if row is None:
             return False
-        file_path = Path(row["file_path"])
+        file_path = resolve_attachment_path(paper_id, row["file_path"])
         conn.execute("DELETE FROM attachments WHERE paper_id = ? AND attachment_type = ?", (paper_id, attachment_type))
     file_path.unlink(missing_ok=True)
     return True
