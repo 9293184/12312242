@@ -1,9 +1,11 @@
+import { API_BASE } from './api'
+
 export type ThemeMode = 'light' | 'dark' | 'auto'
 
 // Open-Meteo 免费 API（无需 key，支持 CORS，全球覆盖）
 // 文档：https://open-meteo.com/en/docs
 const OPEN_METEO_API = 'https://api.open-meteo.com/v1/forecast'
-// IP 地理定位（作为 Geolocation API 的后备）
+// IP 地理定位（浏览器直连，作为后端定位的后备）
 const IP_GEO_API = 'https://ipapi.co/json/'
 // 反向地理编码（坐标 -> 城市名，BigDataCloud 免费客户端 API，无需 key，支持 CORS）
 const REVERSE_GEO_API = 'https://api.bigdatacloud.net/data/reverse-geocode-client'
@@ -12,9 +14,20 @@ const REVERSE_GEO_API = 'https://api.bigdatacloud.net/data/reverse-geocode-clien
 const STORAGE_KEY_LOCATION = 'paperreading_location_v5'
 const STORAGE_KEY_COMBINED = 'paperreading_weather_sun_v2' // 天气+日出日落合并缓存
 
-// 缓存有效期
-const LOCATION_CACHE_MS = 30 * 24 * 60 * 60 * 1000 // 30 天
+// 缓存有效期（按定位来源区分）
+// - geo：用户授权的浏览器定位，精度高，30 天
+// - ip：公网 IP 定位，可能随网络/代理变化，24 小时
+// - default：兜底默认位置，不缓存
+const LOCATION_CACHE_MS: Record<LocationSource, number> = {
+  geo: 30 * 24 * 60 * 60 * 1000,
+  ip: 24 * 60 * 60 * 1000,
+  default: 0,
+}
 const WEATHER_CACHE_MS = 20 * 60 * 1000 // 20 分钟
+// 兜底默认位置的日出日落只缓存 1 小时（避免错误位置的昼夜数据锁死一整天）
+const FALLBACK_SUN_CACHE_MS = 60 * 60 * 1000
+
+type LocationSource = 'geo' | 'ip' | 'default'
 
 // 默认位置（滨州），当所有定位失败时使用
 const DEFAULT_LOCATION = { lat: 37.3817, lng: 117.7669, city: '' }
@@ -33,6 +46,8 @@ interface CombinedCache {
   date: string // YYYYMMDD
   lat: number
   lng: number
+  // 定位来源：default 时昼夜数据只短时缓存，避免兜底位置锁死一整天
+  locSource: LocationSource
   // 天气
   temp: string
   feelsLike: string
@@ -107,8 +122,32 @@ async function reverseGeocode(lat: number, lng: number): Promise<string> {
   }
 }
 
+// 后端 IP 定位：服务端按访问者公网 IP（反代 X-Forwarded-For）查询。
+// 明文 HTTP 部署时浏览器 Geolocation 不可用、浏览器直连国外 API 易超时，
+// 此路径不受安全上下文/CORS/客户端网络限制影响。
+async function fetchLocationFromBackend(): Promise<LocationCache | null> {
+  try {
+    const res = await fetch(`${API_BASE}/location/geo`, { signal: AbortSignal.timeout(6000) })
+    if (!res.ok) return null
+    const data = await res.json()
+    if (data.source === 'ip' && typeof data.lat === 'number' && typeof data.lng === 'number') {
+      return {
+        lat: data.lat,
+        lng: data.lng,
+        city: data.city || '',
+        fetchedAt: Date.now(),
+        source: 'ip',
+      }
+    }
+  } catch {
+    // 后端不可用或超时
+  }
+  return null
+}
+
 async function doFetchUserLocation(): Promise<LocationCache> {
-  // 优先使用浏览器 Geolocation API（精度高，街道级）
+  // 1) 优先使用浏览器 Geolocation API（精度高，街道级）。
+  //    仅在安全上下文（HTTPS / localhost）下可用；明文 HTTP 部署时直接跳过。
   if (typeof navigator !== 'undefined' && navigator.geolocation) {
     try {
       const pos = await getGeoPosition(5000)
@@ -128,7 +167,14 @@ async function doFetchUserLocation(): Promise<LocationCache> {
     }
   }
 
-  // 回退到 IP 定位
+  // 2) 后端按公网 IP 定位（HTTP 部署下的主路径）
+  const backendLoc = await fetchLocationFromBackend()
+  if (backendLoc) {
+    cacheLocation(backendLoc)
+    return backendLoc
+  }
+
+  // 3) 浏览器直连 IP 定位（后端不可用时的后备）
   try {
     const res = await fetch(IP_GEO_API, { signal: AbortSignal.timeout(5000) })
     if (res.ok) {
@@ -149,14 +195,16 @@ async function doFetchUserLocation(): Promise<LocationCache> {
     // 网络错误或超时
   }
 
-  // 兜底：默认位置
+  // 4) 兜底：默认位置（不缓存，下次加载继续尝试真实定位）
   return { ...DEFAULT_LOCATION, fetchedAt: Date.now(), source: 'default' }
 }
 
 export async function fetchUserLocation(force = false): Promise<LocationCache> {
   if (!force) {
     const cached = getCachedLocation()
-    if (cached && Date.now() - cached.fetchedAt < LOCATION_CACHE_MS) {
+    // 按定位来源使用不同有效期：geo 30 天、ip 24 小时、default 不缓存
+    const ttl = cached ? LOCATION_CACHE_MS[cached.source] ?? 0 : 0
+    if (cached && ttl > 0 && Date.now() - cached.fetchedAt < ttl) {
       return cached
     }
   }
@@ -301,6 +349,7 @@ async function fetchAndCacheCombined(loc: LocationCache): Promise<CombinedCache>
       date: today,
       lat: loc.lat,
       lng: loc.lng,
+      locSource: loc.source,
       temp: w.temp,
       feelsLike: w.feelsLike,
       weatherCode: w.weatherCode,
@@ -321,6 +370,7 @@ async function fetchAndCacheCombined(loc: LocationCache): Promise<CombinedCache>
       date: today,
       lat: loc.lat,
       lng: loc.lng,
+      locSource: loc.source,
       temp: '--',
       feelsLike: '--',
       weatherCode: -1,
@@ -338,6 +388,16 @@ async function fetchAndCacheCombined(loc: LocationCache): Promise<CombinedCache>
 
 // ==================== 公共 API ====================
 
+// 日出日落缓存是否可复用：当天且有数据；兜底默认位置的数据仅 1 小时有效，
+// 以便定位链路恢复后尽快自动纠正（避免默认位置的昼夜数据锁死一整天）。
+function isSunCacheFresh(cached: CombinedCache, today: string): boolean {
+  if (cached.date !== today || !cached.sunrise || !cached.sunset) return false
+  if (cached.locSource === 'default') {
+    return Date.now() - cached.fetchedAt < FALLBACK_SUN_CACHE_MS
+  }
+  return true
+}
+
 /**
  * 获取今日日出日落信息。永远 resolve，不会 reject。
  * 优先级：当日缓存 → Open-Meteo API → 启发式计算（fallback）
@@ -346,8 +406,8 @@ export async function getSunTimesForToday(): Promise<SunInfo> {
   const today = formatLocalDate(new Date())
   const cached = getCombinedCache()
 
-  // 缓存命中：当天数据有效
-  if (cached && cached.date === today && cached.sunrise && cached.sunset) {
+  // 缓存命中：当天数据有效（兜底位置仅 1 小时）
+  if (cached && isSunCacheFresh(cached, today)) {
     const loc = getCachedLocation()
     return {
       sunrise: cached.sunrise,
@@ -425,11 +485,14 @@ export async function getWeatherForNow(): Promise<WeatherInfo> {
 
 export async function refreshSunTimes(): Promise<SunInfo> {
   clearCombinedCache()
+  // 手动刷新同时重新定位（geo 已授权时不会重复弹窗；HTTP 下走 IP 定位）
+  await fetchUserLocation(true)
   return getSunTimesForToday()
 }
 
 export async function refreshWeather(): Promise<WeatherInfo> {
   clearCombinedCache()
+  await fetchUserLocation(true)
   return getWeatherForNow()
 }
 
@@ -490,7 +553,7 @@ export function hasStaleSunCache(): boolean {
   const cached = getCombinedCache()
   if (!cached) return true
   const today = formatLocalDate(new Date())
-  return cached.date !== today
+  return !isSunCacheFresh(cached, today)
 }
 
 // ==================== 启发式日出日落（fallback） ====================

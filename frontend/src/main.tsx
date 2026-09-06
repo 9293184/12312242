@@ -65,7 +65,9 @@ class RootErrorBoundary extends React.Component<{ children: React.ReactNode }, {
 
 ReactDOM.createRoot(document.getElementById('root') as HTMLElement).render(
   <React.StrictMode>
-    <BrowserRouter>
+    {/* basename 与 Vite base 保持一致:根部署为 '/',子路径部署(如 /paperpilot/)时
+        路由前缀自动同步,避免资源前缀与路由前缀不一致导致的匹配失败 */}
+    <BrowserRouter basename={import.meta.env.BASE_URL}>
       <RootErrorBoundary>
         <App />
       </RootErrorBoundary>

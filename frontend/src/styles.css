@@ -241,10 +241,22 @@ input:focus, select:focus { border-color: #7c9cff; box-shadow: 0 0 0 4px rgba(12
   word-break: break-all;
 }
 .row { display: flex; gap: 8px; flex-wrap: wrap; }
-.content { flex: 1; min-width: 0; padding: 32px 36px; overflow-y: auto; overflow-x: hidden; max-width: 1400px; margin: 0 auto; box-shadow: -6px 0 24px -12px rgba(15, 23, 42, 0.06); display: flex; flex-direction: column; }
-.content:has(.folder-page) { max-width: none; margin: 0; box-shadow: none; padding: 0; }
-.content:has(.personalized-home) { max-width: none; margin: 0; box-shadow: none; padding: 0; overflow: hidden; }
+/* 滚动容器本身必须铺满 app-shell 剩余宽度:垂直滚动条始终贴在屏幕最右缘,
+   大屏下右侧不再出现空白(内容列的可读宽度由内部区块自行约束居中)。 */
+.content { flex: 1; min-width: 0; padding: 32px 36px; overflow-y: auto; overflow-x: hidden; box-shadow: -6px 0 24px -12px rgba(15, 23, 42, 0.06); display: flex; flex-direction: column; }
+.content:has(.folder-page) { box-shadow: none; padding: 0; }
+.content:has(.personalized-home) { box-shadow: none; padding: 0; overflow: hidden; }
 .content:has(.empty-state) { justify-content: center; align-items: center; }
+/* 论文详情页:各区块保持 1400px 可读宽度并居中,但不影响滚动容器铺满 */
+.content > .detail-hero,
+.content > .detail-section,
+.content > .file-management-card,
+.content > .edit-toolbar {
+  width: 100%;
+  max-width: 1400px;
+  margin-left: auto;
+  margin-right: auto;
+}
 .eyebrow { display: inline-flex; margin-bottom: 10px; font-size: 12px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; color: #6d7cf5; }
 .empty-state {
   width: 100%;
@@ -2152,6 +2164,7 @@ dd { margin: 0; }
   border-radius: 6px;
   outline: none;
   -moz-appearance: textfield;
+  appearance: textfield;
 }
 
 .reader-page-input::-webkit-outer-spin-button,
@@ -5986,6 +5999,7 @@ dd { margin: 0; }
   line-height: 1.55;
   display: -webkit-box;
   -webkit-line-clamp: 3;
+  line-clamp: 3;
   -webkit-box-orient: vertical;
   overflow: hidden;
 }
@@ -11579,6 +11593,7 @@ body.dark-mode .boot-error-card pre,
   line-height: 1.4;
   display: -webkit-box;
   -webkit-line-clamp: 2;
+  line-clamp: 2;
   -webkit-box-orient: vertical;
   overflow: hidden;
 }

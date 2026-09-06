@@ -258,7 +258,7 @@ export default function SettingsDrawer({
         </button>
       </div>
 
-      <div className="settings-drawer-footer">v1.0.0 · PaperPilot</div>
+      <div className="settings-drawer-footer">v1.0.1 · PaperPilot</div>
     </div>
 
     {showSubDrawer && subPos && (

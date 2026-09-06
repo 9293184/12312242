@@ -232,10 +232,10 @@ function HomePage({ papers, personalizedHome, isDarkMode }: { papers: Paper[]; p
     return <PersonalizedHome isDarkMode={isDarkMode} />
   }
 
-  const done = papers.filter((p) => p.status === 'completed' || p.status === 'analyzed').length
-  const processing = papers.filter((p) =>
-    p.status !== 'completed' && p.status !== 'analyzed' && p.status !== 'failed' && p.status !== 'ready'
-  ).length
+  // 后端论文状态机终态为 'done' / 'failed'(见 backend PAPER_STATUS_DONE/FAILED),
+  // 其余状态(uploaded/mineru_processing/analyzing/duplicate_detected 等)均视为处理中。
+  const done = papers.filter((p) => p.status === 'done').length
+  const processing = papers.filter((p) => p.status !== 'done' && p.status !== 'failed').length
 
   return (
     <div className="empty-state card empty-hero empty-hero-enhanced">

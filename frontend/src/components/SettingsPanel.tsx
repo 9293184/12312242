@@ -346,7 +346,7 @@ export default function SettingsPanel({ open, darkMode, themeMode, sunInfo, init
       const summary = await restoreBackup(restoreFile)
       showBackupFeedback(
         'success',
-        `恢复完成：还原 ${summary.restored_files} 个文件（${summary.restored_size_display}）。建议刷新页面以加载新数据。`,
+        `恢复完成：还原 ${summary.restored_files} 个文件（${summary.restored_size_display}）。请您手动刷新界面，加 载新数据。`,
         true,
       )
       setRestoreFile(null)
@@ -1336,7 +1336,7 @@ export default function SettingsPanel({ open, darkMode, themeMode, sunInfo, init
                       </div>
 
                       <p className="backup-restore-warning">
-                        ⚠️ 恢复将覆盖当前工作区全部数据（包括数据库与文献文件），操作不可撤销，请提前确认备份文件有效。
+                        ⚠️ 恢复将覆盖当前工作区全部数据，操作不可撤销，请提前确认备份文件有效。
                       </p>
                     </div>
                   </>
@@ -1358,7 +1358,7 @@ export default function SettingsPanel({ open, darkMode, themeMode, sunInfo, init
                   </div>
                   <div className="about-meta">
                     <div className="about-name">PaperPilot</div>
-                    <div className="about-version">v1.0.0</div>
+                    <div className="about-version">v1.0.1</div>
                   </div>
                 </div>
 
