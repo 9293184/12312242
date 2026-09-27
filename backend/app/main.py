@@ -11,7 +11,8 @@ from fastapi.responses import FileResponse, Response
 
 from app.api.v1 import api_router
 from app.core.config import settings
-from app.db import initialize_database, seed_initial_data_if_empty
+from app.db import initialize_database
+from app.services.seed_service import seed_initial_library
 
 app = FastAPI(title="PaperReading Demo V1")
 
@@ -41,8 +42,9 @@ for _sub in ("storage", "debug_logs", "task_logs"):
 @app.on_event("startup")
 def on_startup() -> None:
     initialize_database(with_seed=False)
-    # 首次启动且库内为空时写入内置初始文献（三篇大模型相关论文）
-    seed_initial_data_if_empty()
+    # 首次启动且库内为空时写入内置文献（三篇大模型论文 + 内置 PDF），
+    # 并像「刚上传 PDF」一样触发分析。
+    seed_initial_library()
 
 
 @app.get("/health")

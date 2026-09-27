@@ -203,41 +203,64 @@ class TestFuzzySearchBounds:
 
 
 class TestInitialSeed:
-    def test_seeds_when_empty_and_only_once(self, temp_workspace):
-        """首次启动写入内置文献；重复调用不会重复插入。"""
-        from app.db.sqlite import seed_initial_data_if_empty
+    @pytest.fixture(autouse=True)
+    def _no_background_analysis(self, monkeypatch):
+        # 播种会像上传一样触发后台分析；测试里屏蔽掉，避免真实解析与网络调用
+        monkeypatch.setattr("app.services.seed_service.run_analysis_exclusive", lambda *a, **k: None)
 
-        assert seed_initial_data_if_empty() == 3
-        assert seed_initial_data_if_empty() == 0  # 标记文件已存在
+    def test_seeds_papers_with_pdfs_and_only_once(self, temp_workspace):
+        """首次启动写入 3 篇内置文献并放置 PDF；重复调用不重复插入。"""
+        from app.services.seed_service import seed_initial_library
+
+        assert seed_initial_library() == 3
+        assert seed_initial_library() == 0  # 标记文件已存在
+
         with session() as conn:
             assert conn.execute("SELECT COUNT(*) FROM papers").fetchone()[0] == 3
+            originals = conn.execute(
+                "SELECT COUNT(*) FROM attachments WHERE attachment_type = 'original'"
+            ).fetchone()[0]
+            assert originals == 3
 
-    def test_seeded_papers_are_metadata_only(self, temp_workspace):
-        """内置文献只有题录、没有 PDF，状态为终态 'imported'。"""
-        from app.db.sqlite import seed_initial_data_if_empty
-        from app.services.paper_service import PAPER_STATUS_IMPORTED
+        # PDF 已按「上传」的规范布局落盘
+        for pid in ("paper-demo-0001", "paper-demo-0002", "paper-demo-0003"):
+            pdf = temp_workspace / "storage" / pid / "original.pdf"
+            assert pdf.exists(), pid
+            assert pdf.stat().st_size > 0, pid
 
-        seed_initial_data_if_empty()
-        with session() as conn:
-            ids = [r["id"] for r in conn.execute("SELECT id FROM papers ORDER BY id")]
+    def test_seeded_papers_look_like_uploads(self, temp_workspace):
+        """内置文献应跟「刚上传 PDF」一致：有原件、元数据完整。"""
+        from app.services.seed_service import seed_initial_library
 
-        assert len(ids) == 3
-        for pid in ids:
-            detail = get_paper(pid)
-            assert detail is not None
-            assert detail.status == PAPER_STATUS_IMPORTED
-            assert detail.attachments == []
-            assert detail.metadata is not None
-            assert detail.metadata.doi  # 元数据（DOI）已写入
+        seed_initial_library()
+        detail = get_paper("paper-demo-0001")
+        assert detail is not None
+        assert [a.attachment_type for a in detail.attachments] == ["original"]
+        assert detail.metadata is not None
+        assert detail.metadata.doi
 
     def test_does_not_seed_when_library_not_empty(self, temp_workspace):
         """库内已有论文时不插入内置数据（例如从备份恢复后）。"""
-        from app.db.sqlite import seed_initial_data_if_empty
+        from app.services.seed_service import seed_initial_library
 
         create_paper(PaperCreate(title="已存在的论文", status="uploaded"))
-        assert seed_initial_data_if_empty() == 0
+        assert seed_initial_library() == 0
         with session() as conn:
             assert conn.execute("SELECT COUNT(*) FROM papers").fetchone()[0] == 1
+
+    def test_missing_pdf_degrades_to_terminal_status(self, temp_workspace, monkeypatch):
+        """内置 PDF 缺失时降级为终态，不能卡在「正在分析」。"""
+        from app.services import seed_service
+        from app.services.paper_service import PAPER_STATUS_IMPORTED
+        from app.services.seed_service import seed_initial_library
+
+        monkeypatch.setattr(seed_service, "_SEED_PDF_DIR", temp_workspace / "nonexistent")
+        seed_initial_library()
+
+        detail = get_paper("paper-demo-0001")
+        assert detail is not None
+        assert detail.status == PAPER_STATUS_IMPORTED
+        assert detail.attachments == []
 
 
 class TestInteropService:

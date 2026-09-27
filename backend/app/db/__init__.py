@@ -1,13 +1,13 @@
 from .sqlite import (
+    apply_seed_sql,
     initialize_database,
     purge_database_data,
-    seed_initial_data_if_empty,
     session,
 )
 
 __all__ = [
+    "apply_seed_sql",
     "initialize_database",
     "purge_database_data",
-    "seed_initial_data_if_empty",
     "session",
 ]
