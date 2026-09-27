@@ -66,6 +66,8 @@ export default function SearchPage({ papers }: SearchPageProps) {
   const [basicResults, setBasicResults] = useState<Paper[]>([])
   const [searchLoading, setSearchLoading] = useState(false)
   const [deepError, setDeepError] = useState('')
+  // 搜索请求序号：只采纳最新一次搜索的结果，避免慢响应覆盖新结果
+  const searchSeqRef = useRef(0)
 
   const [folders, setFolders] = useState<Folder[]>([])
   const [tags, setTags] = useState<Tag[]>([])
@@ -189,7 +191,9 @@ export default function SearchPage({ papers }: SearchPageProps) {
       })
     }
 
-    return list.sort((a, b) => {
+    // 必须先复制再排序：list 可能仍指向父组件传入的 papers 数组，
+    // 直接 sort 会就地打乱父组件的状态。
+    return [...list].sort((a, b) => {
       const av = (a[sortBy] || '').toString()
       const bv = (b[sortBy] || '').toString()
       return bv.localeCompare(av)
@@ -218,6 +222,7 @@ export default function SearchPage({ papers }: SearchPageProps) {
       setDeepError('')
       return
     }
+    const seq = ++searchSeqRef.current
     setSearchLoading(true)
     setDeepError('')
     try {
@@ -225,12 +230,14 @@ export default function SearchPage({ papers }: SearchPageProps) {
       if (selectedFolderId) filters.folder_id = selectedFolderId
       if (selectedTagIds.length > 0) filters.tag_ids = selectedTagIds
       const res = await searchPapers(trimmed, true, 100, filters, fuzzySearch)
+      if (seq !== searchSeqRef.current) return
       setDeepResults(res.items)
     } catch (e) {
+      if (seq !== searchSeqRef.current) return
       setDeepError(e instanceof Error ? e.message : '深度搜索失败')
       setDeepResults([])
     } finally {
-      setSearchLoading(false)
+      if (seq === searchSeqRef.current) setSearchLoading(false)
     }
   }, [selectedFolderId, selectedTagIds, fuzzySearch, hasActiveFilters])
 
@@ -240,6 +247,7 @@ export default function SearchPage({ papers }: SearchPageProps) {
       setBasicResults([])
       return
     }
+    const seq = ++searchSeqRef.current
     setSearchLoading(true)
     setDeepError('')
     try {
@@ -247,12 +255,14 @@ export default function SearchPage({ papers }: SearchPageProps) {
       if (selectedFolderId) filters.folder_id = selectedFolderId
       if (selectedTagIds.length > 0) filters.tag_ids = selectedTagIds
       const res = await searchPapers(trimmed, false, 100, filters, fuzzySearch)
+      if (seq !== searchSeqRef.current) return
       setBasicResults(res.items as Paper[])
     } catch (e) {
+      if (seq !== searchSeqRef.current) return
       setDeepError(e instanceof Error ? e.message : '搜索失败')
       setBasicResults([])
     } finally {
-      setSearchLoading(false)
+      if (seq === searchSeqRef.current) setSearchLoading(false)
     }
   }, [selectedFolderId, selectedTagIds, fuzzySearch, hasActiveFilters])
 

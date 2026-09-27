@@ -90,6 +90,9 @@ async def stream_chat(
     }
 
     last_error: Exception | None = None
+    # 一旦已经向调用方 yield 过内容，就不能再重试：重试会从头再推一遍，
+    # 客户端会看到重复的文本前缀。
+    yielded_any = False
     for attempt in range(max_retries + 1):
         try:
             async with httpx.AsyncClient(timeout=STREAM_TIMEOUT) as client:
@@ -116,6 +119,7 @@ async def stream_chat(
                                 delta = chunk.get("delta", {})
                                 content = delta.get("content", "")
                                 if content:
+                                    yielded_any = True
                                     yield content
                             except (json.JSONDecodeError, KeyError, IndexError):
                                 continue
@@ -128,18 +132,20 @@ async def stream_chat(
                 "stream_chat http_error attempt=%d/%d status=%d",
                 attempt + 1, max_retries, exc.response.status_code,
             )
-            if attempt < max_retries:
+            if attempt < max_retries and not yielded_any:
                 await _async_sleep(1 + attempt)
                 continue
+            break
         except httpx.RequestError as exc:
             last_error = exc
             logger.warning(
                 "stream_chat request_error attempt=%d/%d error=%s",
                 attempt + 1, max_retries, str(exc),
             )
-            if attempt < max_retries:
+            if attempt < max_retries and not yielded_any:
                 await _async_sleep(2 + attempt * 2)
                 continue
+            break
 
     raise ChatClientError(
         f"stream_chat failed after {max_retries + 1} attempts: {last_error}"

@@ -8,7 +8,6 @@ from pathlib import Path
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response
-from fastapi.staticfiles import StaticFiles
 
 from app.api.v1 import api_router
 from app.core.config import settings
@@ -33,7 +32,10 @@ settings.workspace_dir.mkdir(parents=True, exist_ok=True)
 # Pre-create workspace subdirectories so the structure is ready on a fresh device
 for _sub in ("storage", "debug_logs", "task_logs"):
     (settings.workspace_dir / _sub).mkdir(parents=True, exist_ok=True)
-app.mount("/workspace", StaticFiles(directory=settings.workspace_dir), name="workspace")
+# NOTE: 不要把 workspace_dir 整体挂载为静态目录。
+# workspace 下同时存放 api_config.json(含 API 密钥)、paperreading.db(整库)
+# 和 debug_logs/(完整 LLM 提示词与论文正文)，整体挂载会导致这些内容无鉴权泄露。
+# 论文 PDF 一律通过 /api/v1/papers/{id}/attachments/{type} 接口按需返回。
 
 
 @app.on_event("startup")
@@ -48,7 +50,7 @@ def health() -> dict[str, str]:
 
 # ===== 可选：由后端直接托管前端构建产物（SPA）=====
 # 若 frontend/dist 目录存在（生产部署、或本地已 npm run build），后端同时托管前端：
-#   1. 已注册的 /api/v1/*、/health、/workspace/* 路由优先匹配，不受影响；
+#   1. 已注册的 /api/v1/*、/health 路由优先匹配，不受影响；
 #   2. 存在的静态文件（/assets/*、/icon.png、/poem.md 等）直接返回；
 #   3. 其余 GET 路径（BrowserRouter 深链接，如 /papers/<id> 直接打开/刷新）
 #      一律回退到 index.html，由前端路由接管，避免 404。

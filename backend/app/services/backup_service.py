@@ -20,21 +20,29 @@ copies are safe because the demo opens a fresh connection per request via
 
 from __future__ import annotations
 
-import io
 import json
 import logging
+import os
 import re
+import shutil
+import tempfile
 import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterable
+from typing import BinaryIO, Union
 
 from app.core.config import settings
 from app.core.storage import resolve_attachment_path
 from app.db import session
+from app.db.sqlite import checkpoint_database
 from app.services.api_config import CONFIG_FILE
 
 logger = logging.getLogger(__name__)
+
+# 恢复源：既支持磁盘路径，也支持上传流（避免把整包读进内存）
+RestoreSource = Union[str, Path, BinaryIO]
+
+_COPY_CHUNK_SIZE = 1024 * 1024
 
 # Directories under the workspace that constitute a full backup.
 FULL_BACKUP_SUBDIRS = ("storage", "task_logs", "debug_logs")
@@ -111,10 +119,18 @@ def _add_dir_to_zip(zip_writer: zipfile.ZipFile, root: Path, archive_base: str) 
     return count
 
 
-def build_full_backup() -> tuple[bytes, str, dict]:
-    """Build a complete workspace backup as an in-memory ZIP.
+def _new_temp_zip_path(prefix: str) -> Path:
+    """在系统临时目录创建一个唯一 .zip 路径（不落内存，便于流式下载）。"""
+    fd, name = tempfile.mkstemp(prefix=prefix, suffix=".zip")
+    os.close(fd)
+    return Path(name)
 
-    Returns ``(zip_bytes, suggested_filename, manifest)``.
+
+def build_full_backup() -> tuple[Path, str, dict]:
+    """Build a complete workspace backup as a ZIP on disk.
+
+    Returns ``(zip_path, suggested_filename, manifest)``. The caller owns the
+    file and is responsible for deleting it after streaming the response.
     """
     workspace = settings.workspace_dir
     manifest = {
@@ -126,34 +142,41 @@ def build_full_backup() -> tuple[bytes, str, dict]:
         "files": [],
     }
 
-    buffer = io.BytesIO()
+    zip_path = _new_temp_zip_path("paperpilot_full_backup_")
     total_files = 0
     total_bytes = 0
 
-    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as zf:
-        for source_path, archive_name in FULL_BACKUP_FILES:
-            if source_path.exists() and source_path.is_file():
-                zf.write(source_path, archive_name)
-                size = source_path.stat().st_size
-                total_files += 1
-                total_bytes += size
-                manifest["files"].append({"name": archive_name, "size_bytes": size})
-        for subdir in FULL_BACKUP_SUBDIRS:
-            dir_path = workspace / subdir
-            added = _add_dir_to_zip(zf, dir_path, subdir)
-            total_files += added
-            manifest["files"].append({"name": subdir, "type": "directory", "file_count": added})
+    # WAL 模式下已提交事务可能仍在 -wal 文件里；打包前先合并回主库，
+    # 否则直接复制 paperreading.db 会漏掉最新数据。
+    checkpoint_database()
 
-        manifest["total_files"] = total_files
-        manifest["total_size_bytes"] = total_bytes
-        manifest["total_size_display"] = _format_size(total_bytes)
-        zf.writestr(BACKUP_MANIFEST_NAME, json.dumps(manifest, ensure_ascii=False, indent=2))
+    try:
+        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+            for source_path, archive_name in FULL_BACKUP_FILES:
+                if source_path.exists() and source_path.is_file():
+                    zf.write(source_path, archive_name)
+                    size = source_path.stat().st_size
+                    total_files += 1
+                    total_bytes += size
+                    manifest["files"].append({"name": archive_name, "size_bytes": size})
+            for subdir in FULL_BACKUP_SUBDIRS:
+                dir_path = workspace / subdir
+                added = _add_dir_to_zip(zf, dir_path, subdir)
+                total_files += added
+                manifest["files"].append({"name": subdir, "type": "directory", "file_count": added})
 
-    data = buffer.getvalue()
+            manifest["total_files"] = total_files
+            manifest["total_size_bytes"] = total_bytes
+            manifest["total_size_display"] = _format_size(total_bytes)
+            zf.writestr(BACKUP_MANIFEST_NAME, json.dumps(manifest, ensure_ascii=False, indent=2))
+    except BaseException:
+        zip_path.unlink(missing_ok=True)
+        raise
+
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     filename = f"paperreading_full_backup_{ts}.zip"
-    logger.info("full_backup_built files=%s size=%s", total_files, _format_size(len(data)))
-    return data, filename, manifest
+    logger.info("full_backup_built files=%s size=%s", total_files, _format_size(zip_path.stat().st_size))
+    return zip_path, filename, manifest
 
 
 def _fetch_papers_with_folders() -> list[dict]:
@@ -205,12 +228,15 @@ def _original_pdf_path(paper_id: str) -> Path | None:
     return pdf_path if pdf_path.exists() and pdf_path.is_file() else None
 
 
-def build_papers_export() -> tuple[bytes, str, dict]:
+def build_papers_export() -> tuple[Path, str, dict]:
     """Build a folder-structured ZIP of original PDFs renamed <title> - <authors>.
 
     Papers without an assigned folder go into a top-level "未分类文献" directory.
     Papers whose original PDF is missing are listed in the manifest under
     ``skipped_papers`` so the user knows the export is incomplete.
+
+    Returns ``(zip_path, suggested_filename, manifest)``; the caller owns the
+    file and must delete it after streaming.
     """
     papers = _fetch_papers_with_folders()
     folders_by_parent = _fetch_folder_tree()
@@ -226,63 +252,72 @@ def build_papers_export() -> tuple[bytes, str, dict]:
     exported = 0
     total_bytes = 0
 
-    buffer = io.BytesIO()
-    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as zf:
-        for paper in papers:
-            pdf_path = _original_pdf_path(paper["id"])
-            if pdf_path is None:
-                skipped.append({
-                    "paper_id": paper["id"],
-                    "title": paper["title"] or paper["title_cn"] or paper["title_en"],
-                    "reason": "original_pdf_missing",
-                })
-                continue
+    zip_path = _new_temp_zip_path("paperpilot_papers_export_")
+    try:
+        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+            for paper in papers:
+                pdf_path = _original_pdf_path(paper["id"])
+                if pdf_path is None:
+                    skipped.append({
+                        "paper_id": paper["id"],
+                        "title": paper["title"] or paper["title_cn"] or paper["title_en"],
+                        "reason": "original_pdf_missing",
+                    })
+                    continue
 
-            if paper["folder_id"]:
-                chain = _build_folder_path_chain(paper["folder_id"], folders_by_id)
-            else:
-                chain = [UNCATEGURED_FOLDER_NAME]
-            dir_key = "/".join(chain)
-            used = used_names_per_dir.setdefault(dir_key, set())
+                if paper["folder_id"]:
+                    chain = _build_folder_path_chain(paper["folder_id"], folders_by_id)
+                else:
+                    chain = [UNCATEGURED_FOLDER_NAME]
+                dir_key = "/".join(chain)
+                used = used_names_per_dir.setdefault(dir_key, set())
 
-            base_name = _build_paper_display_name(
-                paper["title"], paper["title_cn"], paper["title_en"], paper["authors"], paper["id"]
-            )
-            candidate = f"{base_name}.pdf"
-            counter = 2
-            while candidate in used:
-                candidate = f"{base_name} ({counter}).pdf"
-                counter += 1
-            used.add(candidate)
+                base_name = _build_paper_display_name(
+                    paper["title"], paper["title_cn"], paper["title_en"], paper["authors"], paper["id"]
+                )
+                candidate = f"{base_name}.pdf"
+                counter = 2
+                while candidate in used:
+                    candidate = f"{base_name} ({counter}).pdf"
+                    counter += 1
+                used.add(candidate)
 
-            arcname = f"{dir_key}/{candidate}"
-            zf.write(pdf_path, arcname)
-            exported += 1
-            total_bytes += pdf_path.stat().st_size
+                arcname = f"{dir_key}/{candidate}"
+                zf.write(pdf_path, arcname)
+                exported += 1
+                total_bytes += pdf_path.stat().st_size
 
-        manifest = {
-            "version": BACKUP_MANIFEST_VERSION,
-            "type": "papers_export",
-            "created_at": _utc_now_iso(),
-            "exported_count": exported,
-            "skipped_count": len(skipped),
-            "skipped_papers": skipped,
-            "total_size_bytes": total_bytes,
-            "total_size_display": _format_size(total_bytes),
-        }
-        zf.writestr(BACKUP_MANIFEST_NAME, json.dumps(manifest, ensure_ascii=False, indent=2))
+            manifest = {
+                "version": BACKUP_MANIFEST_VERSION,
+                "type": "papers_export",
+                "created_at": _utc_now_iso(),
+                "exported_count": exported,
+                "skipped_count": len(skipped),
+                "skipped_papers": skipped,
+                "total_size_bytes": total_bytes,
+                "total_size_display": _format_size(total_bytes),
+            }
+            zf.writestr(BACKUP_MANIFEST_NAME, json.dumps(manifest, ensure_ascii=False, indent=2))
+    except BaseException:
+        zip_path.unlink(missing_ok=True)
+        raise
 
-    data = buffer.getvalue()
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     filename = f"paperreading_papers_export_{ts}.zip"
-    logger.info("papers_export_built exported=%s skipped=%s size=%s", exported, len(skipped), _format_size(len(data)))
-    return data, filename, manifest
+    logger.info(
+        "papers_export_built exported=%s skipped=%s size=%s",
+        exported, len(skipped), _format_size(zip_path.stat().st_size),
+    )
+    return zip_path, filename, manifest
 
 
-def _read_manifest_from_zip(zip_bytes: bytes) -> dict | None:
-    """Return the parsed backup manifest from a ZIP, or ``None`` if missing/invalid."""
+def _read_manifest_from_zip(source: RestoreSource) -> dict | None:
+    """Return the parsed backup manifest from a ZIP, or ``None`` if missing/invalid.
+
+    ``source`` 可以是磁盘路径或可寻址的上传流，二者都不会把整包读进内存。
+    """
     try:
-        with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
+        with zipfile.ZipFile(source) as zf:
             if BACKUP_MANIFEST_NAME not in zf.namelist():
                 return None
             with zf.open(BACKUP_MANIFEST_NAME) as f:
@@ -290,15 +325,6 @@ def _read_manifest_from_zip(zip_bytes: bytes) -> dict | None:
     except (zipfile.BadZipFile, json.JSONDecodeError, OSError) as exc:
         logger.warning("backup_manifest_read_failed error=%s", exc)
         return None
-
-
-def _iter_zip_members(zip_bytes: bytes) -> Iterable[tuple[str, bytes]]:
-    with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
-        for info in zf.infolist():
-            if info.is_dir():
-                continue
-            with zf.open(info) as f:
-                yield info.filename, f.read()
 
 
 def _resolve_restore_target(arcname: str) -> Path | None:
@@ -385,7 +411,7 @@ def _reanchor_markdown_paths() -> int:
     return updated
 
 
-def restore_full_backup(zip_bytes: bytes) -> dict:
+def restore_full_backup(source: RestoreSource) -> dict:
     """Validate and apply a full backup ZIP to the current workspace.
 
     Strategy:
@@ -393,33 +419,47 @@ def restore_full_backup(zip_bytes: bytes) -> dict:
     2. Stream members into the workspace; existing files are overwritten.
     3. Reset the in-memory settings cache so subsequent requests reload config.
 
+    ``source`` 可为磁盘路径或可寻址的上传流；成员逐个流式写盘，
+    既不会把整包读进内存，也不会把单个成员整体读进内存。
+
     Returns a summary dict with counts of files restored.
     """
-    manifest = _read_manifest_from_zip(zip_bytes)
-    if not manifest:
-        raise ValueError("无效的备份文件：缺少 backup_manifest.json 或文件已损坏")
-    if manifest.get("type") != "full":
-        raise ValueError("该备份不是全量备份，无法用于恢复（仅全量备份支持恢复）")
+    try:
+        zf = zipfile.ZipFile(source)
+    except zipfile.BadZipFile as exc:
+        raise ValueError("无效的备份文件：不是有效的 ZIP") from exc
 
-    workspace = settings.workspace_dir
-    workspace.mkdir(parents=True, exist_ok=True)
-    for subdir in FULL_BACKUP_SUBDIRS:
-        (workspace / subdir).mkdir(parents=True, exist_ok=True)
-    CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with zf:
+        if BACKUP_MANIFEST_NAME not in zf.namelist():
+            raise ValueError("无效的备份文件：缺少 backup_manifest.json 或文件已损坏")
+        try:
+            with zf.open(BACKUP_MANIFEST_NAME) as f:
+                manifest = json.loads(f.read().decode("utf-8"))
+        except (json.JSONDecodeError, OSError) as exc:
+            raise ValueError("无效的备份文件：清单解析失败") from exc
+        if manifest.get("type") != "full":
+            raise ValueError("该备份不是全量备份，无法用于恢复（仅全量备份支持恢复）")
 
-    restored_files = 0
-    restored_bytes = 0
-    for arcname, data in _iter_zip_members(zip_bytes):
-        if arcname == BACKUP_MANIFEST_NAME:
-            continue
-        target = _resolve_restore_target(arcname)
-        if target is None:
-            logger.warning("restore_skip_unsafe_path path=%s", arcname)
-            continue
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_bytes(data)
-        restored_files += 1
-        restored_bytes += len(data)
+        workspace = settings.workspace_dir
+        workspace.mkdir(parents=True, exist_ok=True)
+        for subdir in FULL_BACKUP_SUBDIRS:
+            (workspace / subdir).mkdir(parents=True, exist_ok=True)
+        CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+
+        restored_files = 0
+        restored_bytes = 0
+        for info in zf.infolist():
+            if info.is_dir() or info.filename == BACKUP_MANIFEST_NAME:
+                continue
+            target = _resolve_restore_target(info.filename)
+            if target is None:
+                logger.warning("restore_skip_unsafe_path path=%s", info.filename)
+                continue
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with zf.open(info) as src, target.open("wb") as dst:
+                shutil.copyfileobj(src, dst, _COPY_CHUNK_SIZE)
+            restored_files += 1
+            restored_bytes += info.file_size
 
     # Force reload of cached API config on the next request.
     try:

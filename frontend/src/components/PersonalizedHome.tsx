@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
 import { Link } from 'react-router-dom'
+import { parsePoemTable } from '../utils/poems'
 
 interface Poem {
   verse: string
@@ -67,23 +68,6 @@ const CACHE_KEY = 'paperreading_personalized_snapshot_v2'
 
 function getRandomItem<T>(arr: T[]): T {
   return arr[Math.floor(Math.random() * arr.length)]
-}
-
-function parsePoems(markdown: string): Poem[] {
-  const lines = markdown.split('\n').filter((l) => l.trim())
-  const poems: Poem[] = []
-  for (const line of lines) {
-    if (!line.startsWith('|') || line.includes(':---') || line.includes('诗句')) continue
-    const parts = line.split('|').map((p) => p.trim()).filter(Boolean)
-    if (parts.length >= 3) {
-      poems.push({
-        verse: parts[0].replace(/\s+/g, ' ').trim(),
-        source: parts[1] || '',
-        author: parts[2] || '',
-      })
-    }
-  }
-  return poems
 }
 
 // 获取远程壁纸图片直链:
@@ -257,7 +241,7 @@ export default function PersonalizedHome({ isDarkMode }: { isDarkMode: boolean }
     const res = await fetch(`${import.meta.env.BASE_URL}poem.md`)
     if (!res.ok) throw new Error('failed to fetch poem.md')
     const text = await res.text()
-    const parsed = parsePoems(text)
+    const parsed = parsePoemTable(text)
     if (parsed.length === 0) throw new Error('empty poem list')
     poemsRef.current = parsed
     return parsed

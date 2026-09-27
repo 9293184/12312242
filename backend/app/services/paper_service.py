@@ -336,6 +336,12 @@ def _edit_distance(a: str, b: str) -> int:
     return prev[-1]
 
 
+# 模糊匹配的规模上限：分析全文可达十万字符，逐字符滑动窗口 + 编辑距离
+# 会让单次查询耗时数秒。精确匹配仍覆盖全文，模糊匹配只在有界范围内进行。
+_FUZZY_TEXT_LIMIT = 20_000
+_FUZZY_MAX_WORDS = 3_000
+
+
 def _is_fuzzy_match(text: str, term: str, threshold: float = 0.6) -> bool:
     """Check if term approximately matches text via prefix, edit distance, or substring.
 
@@ -346,19 +352,20 @@ def _is_fuzzy_match(text: str, term: str, threshold: float = 0.6) -> bool:
     text_lower = text.lower()
     term = term.lower()
 
-    # Exact substring match (already handled by caller, but kept for safety)
+    # 精确子串匹配：覆盖全文，成本低
     if term in text_lower:
         return True
 
-    # Split text into word-level tokens for edit-distance matching
-    text_words = re.findall(r"[a-zA-Z0-9\u4e00-\u9fff]+", text_lower)
+    # 以下为模糊匹配：限定在文本前 _FUZZY_TEXT_LIMIT 个字符内，控制耗时
+    bounded = text_lower[:_FUZZY_TEXT_LIMIT]
+    text_words = re.findall(r"[a-zA-Z0-9\u4e00-\u9fff]+", bounded)[:_FUZZY_MAX_WORDS]
     if not text_words:
         # For CJK-heavy text without spaces, use sliding window
         # Take substrings of length close to len(term) and check edit distance
         term_len = len(term)
         best_ratio = 0.0
-        for i in range(len(text_lower) - term_len + 1):
-            window = text_lower[i : i + term_len]
+        for i in range(len(bounded) - term_len + 1):
+            window = bounded[i : i + term_len]
             dist = _edit_distance(window, term)
             ratio = 1.0 - dist / max(len(window), len(term))
             if ratio > best_ratio:
@@ -971,7 +978,9 @@ def upsert_attachment_file(paper_id: str, attachment_type: str, source_path: str
             """,
             (attachment_id, paper_id, attachment_type, final_name, str(stored_path), file_size, "application/pdf", None, None),
         )
-        conn.execute("UPDATE papers SET status = 'parsed', updated_at = CURRENT_TIMESTAMP WHERE id = ?", (paper_id,))
+        # 仅原件上传才推进解析状态；上传翻译件/对应件不应回退已完成的状态
+        if attachment_type == "original":
+            conn.execute("UPDATE papers SET status = 'parsed', updated_at = CURRENT_TIMESTAMP WHERE id = ?", (paper_id,))
     return attachment_id
 
 
@@ -1033,27 +1042,18 @@ def save_paper_annotations(paper_id: str, attachment_type: str, annotations: lis
     annotations_json = json.dumps(annotations or [], ensure_ascii=False)
     annotation_id = str(uuid4())
     with session() as conn:
-        existing = conn.execute(
-            "SELECT id FROM paper_annotations WHERE paper_id = ? AND attachment_type = ?",
-            (paper_id, attachment_type),
-        ).fetchone()
-        if existing is None:
-            conn.execute(
-                """
-                INSERT INTO paper_annotations (id, paper_id, attachment_type, annotations_json)
-                VALUES (?, ?, ?, ?)
-                """,
-                (annotation_id, paper_id, attachment_type, annotations_json),
-            )
-        else:
-            conn.execute(
-                """
-                UPDATE paper_annotations
-                SET annotations_json = ?, updated_at = CURRENT_TIMESTAMP
-                WHERE id = ?
-                """,
-                (annotations_json, existing["id"]),
-            )
+        # 单条 upsert：依赖唯一索引 ux_paper_annotations(paper_id, attachment_type)，
+        # 避免「先查后插」在并发保存时插入重复行。
+        conn.execute(
+            """
+            INSERT INTO paper_annotations (id, paper_id, attachment_type, annotations_json)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(paper_id, attachment_type) DO UPDATE SET
+                annotations_json = excluded.annotations_json,
+                updated_at = CURRENT_TIMESTAMP
+            """,
+            (annotation_id, paper_id, attachment_type, annotations_json),
+        )
     return get_paper_annotations(paper_id, attachment_type)
 
 
@@ -1273,6 +1273,30 @@ def _parse_with_mineru_or_ocr(
     return parsed
 
 
+def run_analysis_exclusive(
+    paper_id: str,
+    original_attachment_path: str,
+    force_mineru_refresh: bool = False,
+) -> None:
+    """独占地运行一次分析，避免同一论文的分析任务并发执行。
+
+    若该论文已有分析在跑，则直接跳过本次（后台任务重复触发属正常情况）。
+    """
+    from app.core.paper_lock import release, try_acquire
+
+    if not try_acquire(paper_id):
+        logger.info("paper_analysis_skipped_already_running paper_id=%s", paper_id)
+        log_task_event(
+            paper_id, step="跳过重复分析", api="run_analysis_exclusive",
+            status="skipped", detail="该论文已有分析任务在执行",
+        )
+        return
+    try:
+        auto_parse_and_analyze(paper_id, original_attachment_path, force_mineru_refresh)
+    finally:
+        release(paper_id)
+
+
 def auto_parse_and_analyze(
     paper_id: str,
     original_attachment_path: str,
@@ -1418,11 +1442,11 @@ def auto_parse_and_analyze(
                 """
                 UPDATE papers
                 SET
-                    title = ?,
+                    title = COALESCE(NULLIF(?, ''), title),
                     title_cn = ?,
                     title_en = ?,
                     authors = COALESCE(NULLIF(?, ''), authors),
-                    abstract = ?,
+                    abstract = COALESCE(NULLIF(?, ''), abstract),
                     source_url = COALESCE(NULLIF(?, ''), source_url),
                     status = 'duplicate_detected',
                     updated_at = CURRENT_TIMESTAMP
@@ -1591,11 +1615,11 @@ def auto_parse_and_analyze(
             """
             UPDATE papers
             SET
-                title = ?,
+                title = COALESCE(NULLIF(?, ''), title),
                 title_cn = ?,
                 title_en = ?,
                 authors = COALESCE(NULLIF(?, ''), authors),
-                abstract = ?,
+                abstract = COALESCE(NULLIF(?, ''), abstract),
                 source_url = COALESCE(NULLIF(?, ''), source_url),
                 status = 'parsed',
                 updated_at = CURRENT_TIMESTAMP
@@ -1927,7 +1951,6 @@ def update_paper(paper_id: str, payload: PaperUpdate) -> dict:
                         metadata_fields_to_update.get("title_en") or metadata_fields_to_update.get("title_cn") or "",
                         metadata_fields_to_update.get("abstract") or "",
                         sections_json,
-                        "",
                     ),
                 )
                 metadata_updated = True
@@ -2225,11 +2248,11 @@ def continue_analysis_after_duplicate(paper_id: str) -> str:
             INSERT INTO papers (id, title, title_cn, title_en, authors, abstract, source_url, status, created_at, updated_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, 'parsed', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
             ON CONFLICT(id) DO UPDATE SET
-                title = ?,
+                title = COALESCE(NULLIF(?, ''), title),
                 title_cn = ?,
                 title_en = ?,
                 authors = COALESCE(NULLIF(?, ''), authors),
-                abstract = ?,
+                abstract = COALESCE(NULLIF(?, ''), abstract),
                 source_url = COALESCE(NULLIF(?, ''), source_url),
                 status = 'parsed',
                 updated_at = CURRENT_TIMESTAMP

@@ -250,13 +250,16 @@ export default function ChatSidebar({
     }
   }, [])
 
-  // Cleanup the RAF loop if the component unmounts mid-stream.
+  // Cleanup the RAF loop and any in-flight stream if the component unmounts.
   useEffect(() => {
     return () => {
       if (typewriterRafRef.current !== null) {
         cancelAnimationFrame(typewriterRafRef.current)
         typewriterRafRef.current = null
       }
+      // 组件卸载时中止正在进行的流式请求，避免请求继续跑并在已卸载组件上 setState
+      abortRef.current?.abort()
+      abortRef.current = null
     }
   }, [])
 
@@ -266,33 +269,39 @@ export default function ChatSidebar({
   // new conversation, not append to an existing one.
   useEffect(() => {
     if (!paperId) return
+    let cancelled = false
     setIsLoadingSessions(true)
     listChatSessions(paperId)
       .then(res => {
+        if (cancelled) return
         setSessions(res.sessions)
         if (res.sessions.length > 0 && !currentSessionId && !openedWithSelectedText) {
           setCurrentSessionId(res.sessions[0].id)
         }
       })
-      .catch(() => setSessions([]))
-      .finally(() => setIsLoadingSessions(false))
+      .catch(() => { if (!cancelled) setSessions([]) })
+      .finally(() => { if (!cancelled) setIsLoadingSessions(false) })
 
     getQuickCommands()
-      .then(res => setQuickCommands(res.commands))
-      .catch(() => setQuickCommands([]))
+      .then(res => { if (!cancelled) setQuickCommands(res.commands) })
+      .catch(() => { if (!cancelled) setQuickCommands([]) })
+    return () => { cancelled = true }
   }, [paperId]) // eslint-disable-line react-hooks/exhaustive-deps
 
-  // Load messages when session changes
+  // Load messages when session changes.
+  // 用 cancelled 标记防止竞态：快速切换会话时，旧请求的慢响应不应覆盖新会话的消息。
   useEffect(() => {
     if (!currentSessionId) {
       setMessages([])
       return
     }
+    let cancelled = false
     setIsLoadingMessages(true)
     getChatSession(currentSessionId)
-      .then(data => setMessages(data.messages || []))
-      .catch(() => setMessages([]))
-      .finally(() => setIsLoadingMessages(false))
+      .then(data => { if (!cancelled) setMessages(data.messages || []) })
+      .catch(() => { if (!cancelled) setMessages([]) })
+      .finally(() => { if (!cancelled) setIsLoadingMessages(false) })
+    return () => { cancelled = true }
   }, [currentSessionId])
 
   // Auto-scroll to bottom when messages update — but only if user is near
@@ -347,8 +356,10 @@ export default function ChatSidebar({
     setShowSessionList(false)
   }, [currentSessionId, onSessionChange])
 
-  const handleSend = useCallback(async () => {
-    const message = inputValue.trim()
+  const handleSend = useCallback(async (overrideMessage?: string, overrideEditId?: string | null) => {
+    // 支持显式传参：编辑消息时 setState 尚未提交，直接读 inputValue 会拿到旧值
+    const message = (overrideMessage ?? inputValue).trim()
+    const editId = overrideEditId === undefined ? editingMessageId : overrideEditId
     if (!message || isStreaming) return
 
     let sessionId = currentSessionId
@@ -409,7 +420,7 @@ export default function ChatSidebar({
         sessionId,
         message,
         selectedText || '',
-        editingMessageId || '',
+        editId || '',
         (chunk, done) => {
           if (done) {
             // Mark the message as done; stopTypewriter flushes any remaining
@@ -475,13 +486,17 @@ export default function ChatSidebar({
   }, [])
 
   const handleSubmitEdit = useCallback(async () => {
-    if (!editingMessageId || !editingContent.trim()) {
+    const content = editingContent.trim()
+    if (!editingMessageId || !content) {
       setEditingMessageId(null)
       return
     }
-    setInputValue(editingContent)
+    // 显式把内容与编辑目标传进去：此前依赖 setState 后再 handleSend，
+    // 读到的是旧闭包里的 inputValue，导致编辑实际发出的是上一次的内容。
+    const editId = editingMessageId
     setEditingMessageId(null)
-    await handleSend()
+    setInputValue('')
+    await handleSend(content, editId)
   }, [editingMessageId, editingContent, handleSend])
 
   const handleCopyMessage = useCallback((content: string) => {

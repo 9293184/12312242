@@ -55,7 +55,8 @@ export default function FileManagement({
     attachments.find((a) => a.attachment_type === type)
 
   const handleRead = (attachmentType: string) => {
-    window.open(`/papers/${paperId}/read/${attachmentType}`, '_blank')
+    // 用 BASE_URL 拼接：window.open 不经过 router，写死根路径会在子路径部署下 404
+    window.open(`${import.meta.env.BASE_URL}papers/${paperId}/read/${attachmentType}`, '_blank')
   }
 
   const startUpload = (type: AttachmentType) => {

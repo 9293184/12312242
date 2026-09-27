@@ -2,6 +2,7 @@ import { useMemo, useState, useEffect, useRef } from 'react'
 import { useNavigate } from 'react-router-dom'
 import type { PaperDetail, PaperEditData, TaskLogEntry } from '../api'
 import { getTaskLogs, API_BASE } from '../api'
+import { isAnalyzingStatus } from '../utils/paperStatus'
 import ConfirmDialog from './ConfirmDialog'
 import FileManagement from './FileManagement'
 import RichText from './RichText'
@@ -178,8 +179,7 @@ export default function PaperDetailPage({
 
   useEffect(() => {
     if (!detail || !detail.id) return
-    const POLLING_STATUSES = ['uploaded', 'mineru_processing', 'mineru_converted', 'ocr_fallback', 'text_extracting', 'metadata_extracting', 'analyzing', 'parsed', 'duplicate_detected']
-    const analyzing = detail.status && POLLING_STATUSES.includes(detail.status)
+    const analyzing = detail.status && isAnalyzingStatus(detail.status)
     if (!analyzing && detail.status !== 'failed') {
       return
     }
@@ -200,7 +200,7 @@ export default function PaperDetailPage({
 
       if (cancelled) return
 
-      const stillAnalyzing = detail.status && POLLING_STATUSES.includes(detail.status)
+      const stillAnalyzing = detail.status && isAnalyzingStatus(detail.status)
       if (!stillAnalyzing) return
       const currentLogs = taskLogsRef.current
       if (currentLogs.length > 0) {
@@ -334,7 +334,8 @@ export default function PaperDetailPage({
       if (browserFullscreen) {
         navigate(`/papers/${detail.id}/read/original`)
       } else {
-        window.open(`/papers/${detail.id}/read/original`, '_blank')
+        // 用 BASE_URL 拼接：window.open 不经过 router，写死根路径会在子路径部署下 404
+        window.open(`${import.meta.env.BASE_URL}papers/${detail.id}/read/original`, '_blank')
       }
     }
   }
@@ -401,8 +402,7 @@ export default function PaperDetailPage({
     }
   }
 
-  const ANALYZING_STATUSES = ['uploaded', 'mineru_processing', 'mineru_converted', 'ocr_fallback', 'text_extracting', 'metadata_extracting', 'analyzing', 'parsed', 'duplicate_detected']
-  const isAnalyzing = !!(detail && ANALYZING_STATUSES.includes(detail.status))
+  const isAnalyzing = !!(detail && isAnalyzingStatus(detail.status))
   const isDone = detail?.status === 'done'
 
   const EXPECTED_STEPS = [

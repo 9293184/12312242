@@ -8,6 +8,7 @@ The goal is to keep database bootstrapping deterministic:
 
 from __future__ import annotations
 
+import logging
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -16,6 +17,8 @@ from typing import Iterator
 
 from app.core.config import settings
 
+logger = logging.getLogger(__name__)
+
 
 def _connect(db_path: Path) -> sqlite3.Connection:
     db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -23,7 +26,30 @@ def _connect(db_path: Path) -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON;")
     conn.execute("PRAGMA busy_timeout = 10000;")
+    # WAL：读不阻塞写、写不阻塞读，适合「请求线程池 + 后台分析线程」并发的本地场景
+    try:
+        conn.execute("PRAGMA journal_mode = WAL;")
+        conn.execute("PRAGMA synchronous = NORMAL;")
+    except sqlite3.Error:
+        pass
     return conn
+
+
+def checkpoint_database() -> None:
+    """把 WAL 中已提交的事务合并回主库文件。
+
+    启用 WAL 后，仅复制 ``paperreading.db`` 可能拿不到最新数据（还在 -wal 里），
+    因此备份前必须先 checkpoint。
+    """
+    try:
+        conn = _connect(settings.db_path)
+        try:
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+            conn.commit()
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        logger.warning("wal_checkpoint_failed", exc_info=True)
 
 
 @contextmanager
@@ -237,16 +263,28 @@ def initialize_database(with_seed: bool = False) -> None:
 def purge_database_data() -> None:
     """Remove all rows while keeping the schema intact."""
 
+    # 删除顺序按外键依赖排列：先删子表再删父表，避免触发外键约束。
+    tables = [
+        "paper_tags",
+        "paper_annotations",
+        "chat_messages",
+        "chat_sessions",
+        "paper_analysis",
+        "paper_texts",
+        "paper_read_state",
+        "attachments",
+        "import_jobs",
+        "papers",
+        "tags",
+        "folders",
+    ]
     with session() as conn:
-        tables = [
-            "paper_analysis",
-            "paper_annotations",
-            "paper_read_state",
-            "paper_texts",
-            "attachments",
-            "import_jobs",
-            "papers",
-        ]
         for table in tables:
             conn.execute(f"DELETE FROM {table}")
-        conn.execute("DELETE FROM sqlite_sequence")
+        # sqlite_sequence 仅在存在 AUTOINCREMENT 列时才会被创建；本项目主键
+        # 均为 TEXT，该表通常不存在，直接 DELETE 会抛 "no such table"。
+        has_sequence = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'sqlite_sequence'"
+        ).fetchone()
+        if has_sequence is not None:
+            conn.execute("DELETE FROM sqlite_sequence")

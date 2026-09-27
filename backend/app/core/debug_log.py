@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -161,11 +162,22 @@ def log_task_update(
     if error:
         existing[idx]["error"] = error[:500]
 
-    # Rewrite the whole file
-    with path.open("w", encoding="utf-8") as handle:
-        for entry in existing:
-            handle.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    # Rewrite the whole file (原子写入，避免中途崩溃损坏日志)
+    _atomic_write_lines(path, existing)
     return path
+
+
+def _atomic_write_lines(path: Path, entries: list[dict[str, Any]]) -> None:
+    """先写临时文件再原子替换，避免写入中途失败导致日志损坏。"""
+    tmp = path.with_name(path.name + ".tmp")
+    try:
+        with tmp.open("w", encoding="utf-8") as handle:
+            for entry in entries:
+                handle.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        os.replace(tmp, path)
+    except OSError:
+        tmp.unlink(missing_ok=True)
+        raise
 
 
 def read_task_logs(paper_id: str) -> list[dict[str, Any]]:

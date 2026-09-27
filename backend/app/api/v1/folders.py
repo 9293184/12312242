@@ -3,14 +3,16 @@
 from __future__ import annotations
 
 import logging
+import tempfile
 from pathlib import Path
 from typing import List, Optional, Tuple
+from uuid import uuid4
 
 from fastapi import APIRouter, File, HTTPException, UploadFile
 
 from app.models import FolderCreate, FolderPapersAssign, FolderResponse, FolderTreeNode, FolderUpdate
 from app.services import (
-    batch_import_papers,
+    batch_import_files,
     batch_move_papers,
     batch_remove_papers_from_folder,
     create_folder,
@@ -32,6 +34,7 @@ router = APIRouter(prefix="/folders", tags=["folders"])
 ALLOWED_PDF_MIME_TYPES = {"application/pdf", "application/x-pdf", "application/octet-stream"}
 MAX_BATCH_FILES = 50
 MAX_BATCH_FILE_SIZE = 100 * 1024 * 1024  # 100 MB per file
+_UPLOAD_CHUNK_SIZE = 1024 * 1024  # 1 MB
 
 
 @router.get("/tree", response_model=List[FolderTreeNode])
@@ -111,11 +114,14 @@ def get_folder_papers_api(folder_id: str) -> dict:
 
 
 @router.post("/{folder_id}/import")
-async def batch_import_api(folder_id: str, files: List[UploadFile] = File(...)) -> dict:
+def batch_import_api(folder_id: str, files: List[UploadFile] = File(...)) -> dict:
     """Batch import PDF files as new papers into a folder.
 
     Each file creates a new paper, stores it as the 'original' attachment,
     assigns it to the target folder, and triggers background analysis.
+
+    同步端点（由 FastAPI 放入线程池），并把每个上传流式写入临时文件，
+    避免把所有文件同时读进内存。
 
     Args:
         folder_id: Target folder ID.
@@ -132,27 +138,46 @@ async def batch_import_api(folder_id: str, files: List[UploadFile] = File(...)) 
     if len(files) > MAX_BATCH_FILES:
         raise HTTPException(status_code=400, detail=f"单次最多导入 {MAX_BATCH_FILES} 个文件")
 
-    file_data: List[Tuple[str, bytes]] = []
-    for f in files:
-        filename = Path(f.filename or "").name
-        if not filename:
-            continue
-        if Path(filename).suffix.lower() != ".pdf":
-            raise HTTPException(status_code=400, detail=f"仅支持 PDF 文件：{filename}")
-        content_type = (f.content_type or "").lower()
-        if content_type and content_type not in ALLOWED_PDF_MIME_TYPES:
-            raise HTTPException(status_code=400, detail=f"仅支持 PDF 文件：{filename}")
-        data = await f.read()
-        if not data:
-            raise HTTPException(status_code=400, detail=f"文件为空：{filename}")
-        if len(data) > MAX_BATCH_FILE_SIZE:
-            raise HTTPException(status_code=400, detail=f"文件过大（>100MB）：{filename}")
-        file_data.append((filename, data))
+    temp_dir = Path(tempfile.gettempdir()) / "paperreading"
+    temp_dir.mkdir(parents=True, exist_ok=True)
 
-    if not file_data:
+    staged: List[Tuple[str, Path]] = []
+    try:
+        for f in files:
+            filename = Path(f.filename or "").name
+            if not filename:
+                continue
+            if Path(filename).suffix.lower() != ".pdf":
+                raise HTTPException(status_code=400, detail=f"仅支持 PDF 文件：{filename}")
+            content_type = (f.content_type or "").lower()
+            if content_type and content_type not in ALLOWED_PDF_MIME_TYPES:
+                raise HTTPException(status_code=400, detail=f"仅支持 PDF 文件：{filename}")
+
+            temp_path = temp_dir / f"{uuid4().hex}_{filename}"
+            total = 0
+            with temp_path.open("wb") as out:
+                while True:
+                    chunk = f.file.read(_UPLOAD_CHUNK_SIZE)
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    if total > MAX_BATCH_FILE_SIZE:
+                        raise HTTPException(status_code=413, detail=f"文件过大（>100MB）：{filename}")
+                    out.write(chunk)
+            if total == 0:
+                temp_path.unlink(missing_ok=True)
+                raise HTTPException(status_code=400, detail=f"文件为空：{filename}")
+            staged.append((filename, temp_path))
+    except BaseException:
+        # 任一文件校验失败：清理已落盘的临时文件，避免残留
+        for _, path in staged:
+            path.unlink(missing_ok=True)
+        raise
+
+    if not staged:
         raise HTTPException(status_code=400, detail="没有可导入的有效文件")
 
-    results = batch_import_papers(folder_id, file_data)
+    results = batch_import_files(folder_id, staged)
     success_count = sum(1 for r in results if r["success"])
     failed_count = len(results) - success_count
     return {

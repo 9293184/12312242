@@ -133,12 +133,74 @@ export type SearchResultResponse = {
 // VITE_API_BASE_URL only when the API lives on a different origin.
 export const API_BASE = import.meta.env.VITE_API_BASE_URL ?? '/api/v1'
 
-async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(`${API_BASE}${path}`, init)
-  if (!response.ok) {
-    throw new Error(await response.text())
+const DEFAULT_REQUEST_TIMEOUT_MS = 120_000
+export const LONG_REQUEST_TIMEOUT_MS = 10 * 60_000
+
+/** 从错误响应中提取可读信息：优先 {detail}/{message}，否则退回截断后的纯文本。 */
+async function _extractErrorMessage(response: Response): Promise<string> {
+  const fallback = `请求失败（HTTP ${response.status}）`
+  let text = ''
+  try {
+    text = await response.text()
+  } catch {
+    return fallback
   }
-  return response.json() as Promise<T>
+  const trimmed = text.trim()
+  if (!trimmed) return fallback
+  try {
+    const data = JSON.parse(trimmed)
+    const detail = data?.detail ?? data?.message ?? data?.error
+    if (typeof detail === 'string' && detail.trim()) return detail.trim()
+    if (Array.isArray(detail)) {
+      const msgs = detail
+        .map((d: unknown) => (typeof d === 'string' ? d : (d as { msg?: string })?.msg))
+        .filter(Boolean)
+      if (msgs.length) return msgs.join('；')
+    }
+  } catch {
+    // 非 JSON：按纯文本处理
+  }
+  // 避免把整页 HTML 错误页原样抛给用户
+  return trimmed.length > 300 ? `${trimmed.slice(0, 300)}…` : trimmed
+}
+
+async function request<T>(
+  path: string,
+  init?: RequestInit,
+  timeoutMs: number = DEFAULT_REQUEST_TIMEOUT_MS,
+): Promise<T> {
+  const controller = new AbortController()
+  const external = init?.signal
+  const onExternalAbort = () => controller.abort()
+  if (external) {
+    if (external.aborted) controller.abort()
+    else external.addEventListener('abort', onExternalAbort, { once: true })
+  }
+  const timer = setTimeout(() => controller.abort(), timeoutMs)
+  try {
+    const response = await fetch(`${API_BASE}${path}`, { ...init, signal: controller.signal })
+    if (!response.ok) {
+      throw new Error(await _extractErrorMessage(response))
+    }
+    if (response.status === 204) {
+      return undefined as T
+    }
+    try {
+      return (await response.json()) as T
+    } catch {
+      throw new Error('服务器返回了无法解析的数据')
+    }
+  } catch (err) {
+    if (err instanceof DOMException && err.name === 'AbortError') {
+      // 调用方主动取消时保留 AbortError 语义；否则视为超时
+      if (external?.aborted) throw err
+      throw new Error('请求超时，请检查后端服务是否正常')
+    }
+    throw err
+  } finally {
+    clearTimeout(timer)
+    external?.removeEventListener('abort', onExternalAbort)
+  }
 }
 
 export function listPapers() {
@@ -196,6 +258,7 @@ export async function uploadAttachment(paperId: string, attachmentType: 'origina
   return request<{ paper_id: string; attachment_id: string; attachment_type: string; analysis_triggered?: boolean; analysis_status?: string }>(
     `/papers/${paperId}/attachments/upload?attachment_type=${attachmentType}`,
     { method: 'POST', body: form },
+    LONG_REQUEST_TIMEOUT_MS,
   )
 }
 
@@ -471,7 +534,62 @@ export async function restoreBackup(file: File): Promise<RestoreSummary> {
   return request<RestoreSummary>(`/settings/restore`, {
     method: 'POST',
     body: form,
-  })
+  }, LONG_REQUEST_TIMEOUT_MS)
+}
+
+// ===== 文献互通（与 Zotero / Mendeley / EndNote 等互导） =====
+
+export type InteropFormat = 'csljson' | 'bibtex' | 'ris'
+
+export type InteropImportItem = {
+  title: string
+  paper_id: string
+  status: 'imported' | 'skipped' | 'failed'
+  error: string
+}
+
+export type InteropImportResult = {
+  imported: number
+  skipped: number
+  failed: number
+  total: number
+  items: InteropImportItem[]
+  format: InteropFormat | string
+}
+
+export const INTEROP_FORMATS: { id: InteropFormat; label: string; hint: string }[] = [
+  { id: 'csljson', label: 'CSL JSON', hint: 'Zotero 原生，字段最全（推荐）' },
+  { id: 'bibtex', label: 'BibTeX', hint: 'LaTeX / JabRef 通用' },
+  { id: 'ris', label: 'RIS', hint: 'EndNote / Mendeley 通用' },
+]
+
+export function importReferences(
+  file: File,
+  options?: { format?: InteropFormat; folderId?: string; skipDuplicates?: boolean },
+) {
+  const form = new FormData()
+  form.append('file', file)
+  if (options?.format) form.append('format', options.format)
+  if (options?.folderId) form.append('folder_id', options.folderId)
+  form.append('skip_duplicates', String(options?.skipDuplicates ?? true))
+  return request<InteropImportResult>(`/interop/import`, { method: 'POST', body: form })
+}
+
+const _INTEROP_EXT: Record<InteropFormat, string> = { csljson: 'json', bibtex: 'bib', ris: 'ris' }
+
+export async function downloadReferences(format: InteropFormat, paperIds?: string[]): Promise<void> {
+  const qs = new URLSearchParams({ format })
+  if (paperIds?.length) qs.set('paper_ids', paperIds.join(','))
+  const response = await fetch(`${API_BASE}/interop/export?${qs.toString()}`)
+  if (!response.ok) {
+    throw new Error(await response.text())
+  }
+  const blob = await response.blob()
+  const filename = _parseFilenameFromDisposition(
+    response.headers.get('Content-Disposition'),
+    `paperpilot_export.${_INTEROP_EXT[format]}`,
+  )
+  _triggerBlobDownload(blob, filename)
 }
 
 // ========== Duplicate Detection ==========
@@ -670,7 +788,7 @@ export function batchImportPapers(folderId: string, files: File[]) {
   return request<BatchImportResult>(`/folders/${folderId}/import`, {
     method: 'POST',
     body: form,
-  })
+  }, LONG_REQUEST_TIMEOUT_MS)
 }
 
 export type BatchMoveResult = {

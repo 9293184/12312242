@@ -9,8 +9,9 @@ from pathlib import Path
 from typing import List, Tuple
 
 from fastapi import APIRouter, HTTPException, UploadFile, File
-from fastapi.responses import Response
+from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel
+from starlette.background import BackgroundTask
 
 from app.core.config import settings
 from app.services.api_config import (
@@ -393,52 +394,52 @@ def get_backup_info() -> dict:
 
 @router.post("/backup/full")
 def create_full_backup() -> Response:
-    """Build and return a complete workspace backup ZIP."""
+    """Build and stream a complete workspace backup ZIP."""
     try:
-        data, filename, _manifest = build_full_backup()
+        zip_path, filename, _manifest = build_full_backup()
     except Exception as exc:  # pragma: no cover - defensive
         raise HTTPException(status_code=500, detail=f"生成全量备份失败：{exc}") from exc
-    return Response(
-        content=data,
+    # FileResponse 流式读取磁盘文件，并负责在发送完成后删除临时包
+    return FileResponse(
+        path=zip_path,
         media_type="application/zip",
-        headers={
-            "Content-Disposition": f'attachment; filename="{filename}"',
-            "Content-Length": str(len(data)),
-        },
+        filename=filename,
+        background=BackgroundTask(zip_path.unlink, missing_ok=True),
     )
 
 
 @router.post("/backup/papers")
 def create_papers_export() -> Response:
-    """Build and return a ZIP of original PDFs preserving folder hierarchy."""
+    """Build and stream a ZIP of original PDFs preserving folder hierarchy."""
     try:
-        data, filename, manifest = build_papers_export()
+        zip_path, filename, manifest = build_papers_export()
     except Exception as exc:  # pragma: no cover - defensive
         raise HTTPException(status_code=500, detail=f"导出文献失败：{exc}") from exc
     # Stash a small summary in headers so the UI can show skipped papers count
     # without parsing the binary ZIP.
-    return Response(
-        content=data,
+    return FileResponse(
+        path=zip_path,
         media_type="application/zip",
+        filename=filename,
         headers={
-            "Content-Disposition": f'attachment; filename="{filename}"',
-            "Content-Length": str(len(data)),
             "X-Exported-Count": str(manifest.get("exported_count", 0)),
             "X-Skipped-Count": str(manifest.get("skipped_count", 0)),
         },
+        background=BackgroundTask(zip_path.unlink, missing_ok=True),
     )
 
 
 @router.post("/restore")
-async def restore_backup(file: UploadFile = File(...)) -> dict:
-    """Validate and apply an uploaded full-backup ZIP in place."""
+def restore_backup(file: UploadFile = File(...)) -> dict:
+    """Validate and apply an uploaded full-backup ZIP in place.
+
+    同步端点：由 FastAPI 放入线程池执行，避免恢复期间阻塞事件循环；
+    直接透传上传流，不把整包读进内存。
+    """
     if not file.filename or not file.filename.lower().endswith(".zip"):
         raise HTTPException(status_code=400, detail="请上传 .zip 格式的备份文件")
-    zip_bytes = await file.read()
-    if not zip_bytes:
-        raise HTTPException(status_code=400, detail="备份文件为空")
     try:
-        summary = restore_full_backup(zip_bytes)
+        summary = restore_full_backup(file.file)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:  # pragma: no cover - defensive

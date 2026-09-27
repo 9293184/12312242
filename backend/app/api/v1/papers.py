@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import json
 import logging
+import tempfile
 from pathlib import Path
 from threading import Thread
 from typing import List, Optional
+from uuid import uuid4
 
 from fastapi import APIRouter, Body, File, HTTPException, UploadFile
 from pydantic import BaseModel
@@ -17,7 +19,6 @@ from app.db.sqlite import to_utc_isoformat
 from app.models import AnalysisCreate, PaperCreate, PaperDetailResponse, PaperResponse, PaperUpdate, SearchResultItem, SearchResultResponse
 from app.services import (
     SEARCH_FIELD_LABELS,
-    auto_parse_and_analyze,
     check_duplicate_paper,
     continue_analysis_after_duplicate,
     create_paper,
@@ -26,6 +27,7 @@ from app.services import (
     ensure_analysis_placeholder,
     get_paper,
     get_paper_annotations,
+    run_analysis_exclusive,
     save_paper_annotations,
     search_papers,
     update_paper,
@@ -37,8 +39,38 @@ logger = logging.getLogger(__name__)
 
 ALLOWED_ATTACHMENT_TYPES = {"original", "translated", "mapped"}
 ALLOWED_PDF_MIME_TYPES = {"application/pdf", "application/x-pdf", "application/octet-stream"}
+MAX_UPLOAD_FILE_SIZE = 100 * 1024 * 1024  # 100 MB
+_UPLOAD_CHUNK_SIZE = 1024 * 1024  # 1 MB
 
 router = APIRouter(prefix="/papers", tags=["papers"])
+
+
+def _stream_upload_to_temp(file: UploadFile, filename: str) -> Path:
+    """把上传文件流式写入唯一临时路径，避免整块读入内存与并发同名覆盖。
+
+    超过大小上限时中止并清理临时文件。
+    """
+    temp_dir = Path(tempfile.gettempdir()) / "paperreading"
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    temp_path = temp_dir / f"{uuid4().hex}_{filename}"
+    total = 0
+    try:
+        with temp_path.open("wb") as out:
+            while True:
+                chunk = file.file.read(_UPLOAD_CHUNK_SIZE)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > MAX_UPLOAD_FILE_SIZE:
+                    raise HTTPException(status_code=413, detail="文件过大（>100MB）")
+                out.write(chunk)
+    except BaseException:
+        temp_path.unlink(missing_ok=True)
+        raise
+    if total == 0:
+        temp_path.unlink(missing_ok=True)
+        raise HTTPException(status_code=400, detail="Uploaded file is empty")
+    return temp_path
 
 
 def _to_utc_isoformat(value) -> str:
@@ -250,7 +282,12 @@ def create_paper_api(payload: PaperCreate) -> PaperResponse:
 
 @router.put("/{paper_id}", response_model=PaperResponse)
 def update_paper_api(paper_id: str, payload: PaperUpdate) -> PaperResponse:
-    result = update_paper(paper_id, payload)
+    try:
+        result = update_paper(paper_id, payload)
+    except ValueError as exc:
+        # update_paper 对不存在的论文抛 ValueError("Paper not found")，
+        # 这里转换为 404，避免冒泡成未捕获异常返回 500。
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
     if not result.get("updated"):
         paper = get_paper(paper_id)
         if paper is None:
@@ -380,7 +417,7 @@ def reanalyze_paper_api(paper_id: str, force_mineru_refresh: bool = False) -> di
         if original is None:
             return
         try:
-            auto_parse_and_analyze(
+            run_analysis_exclusive(
                 paper_id,
                 str(resolve_attachment_path(paper_id, original.file_path)),
                 force_mineru_refresh=force_mineru_refresh,
@@ -425,7 +462,7 @@ def _mark_paper_failed(paper_id: str, error: str) -> None:
 
 def _background_parse_and_analyze(paper_id: str, temp_path: str) -> None:
     try:
-        auto_parse_and_analyze(paper_id, temp_path)
+        run_analysis_exclusive(paper_id, temp_path)
     except Exception:
         logger.exception(
             "Background auto_parse_and_analyze failed paper_id=%s",
@@ -458,14 +495,7 @@ def upload_attachment_file_api(
     if content_type and content_type not in ALLOWED_PDF_MIME_TYPES:
         raise HTTPException(status_code=400, detail="Only PDF files are allowed")
 
-    temp_dir = Path("/tmp") / "paperreading"
-    temp_dir.mkdir(parents=True, exist_ok=True)
-    temp_path = temp_dir / filename
-    temp_path.write_bytes(file.file.read())
-
-    if temp_path.stat().st_size == 0:
-        temp_path.unlink(missing_ok=True)
-        raise HTTPException(status_code=400, detail="Uploaded file is empty")
+    temp_path = _stream_upload_to_temp(file, filename)
 
     attachment_id = upsert_attachment_file(paper_id, attachment_type, str(temp_path), filename)
     response = {

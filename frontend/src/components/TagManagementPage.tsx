@@ -18,6 +18,7 @@ import {
   batchRemovePapersFromTag,
 } from '../api'
 import ConfirmDialog from './ConfirmDialog'
+import { isAnalyzingStatus } from '../utils/paperStatus'
 
 type TagManagementPageProps = {
   onPapersChanged: () => void
@@ -743,7 +744,7 @@ export default function TagManagementPage({ onPapersChanged, refreshKey }: TagMa
                     <div className="folder-papers-rows">
                       {tagPapers.map(paper => {
                         const title = paper.title || paper.title_cn || paper.title_en || 'Untitled Paper'
-                        const isAnalyzing = ['uploaded', 'mineru_processing', 'mineru_converted', 'ocr_fallback', 'text_extracting', 'metadata_extracting', 'analyzing', 'parsed', 'duplicate_detected'].includes(paper.status)
+                        const isAnalyzing = isAnalyzingStatus(paper.status)
                         const removeChecked = removeSelected.has(paper.id)
                         return (
                           <div

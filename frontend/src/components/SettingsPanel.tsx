@@ -15,6 +15,9 @@ import {
   downloadFullBackup,
   downloadPapersExport,
   restoreBackup,
+  importReferences,
+  downloadReferences,
+  INTEROP_FORMATS,
   type APIConfig as APIConfigType,
   type APIConfigUpdate,
   type MinerUConfigUpdate,
@@ -23,6 +26,8 @@ import {
   type StorageInfo,
   type TestResult,
   type BackupInfo,
+  type InteropFormat,
+  type InteropImportResult,
 } from '../api'
 
 type SettingsPanelProps = {
@@ -102,6 +107,18 @@ const SECTIONS: SettingsSection[] = [
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
         <path d="M21 12a9 9 0 1 1-3-6.7L21 8" />
         <polyline points="21 3 21 8 16 8" />
+      </svg>
+    ),
+  },
+  {
+    id: 'interop',
+    label: '导入 / 导出',
+    icon: (
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+        <path d="M7 16l-4-4 4-4" />
+        <path d="M3 12h13" />
+        <path d="M17 8l4 4-4 4" />
+        <path d="M21 12H8" />
       </svg>
     ),
   },
@@ -189,6 +206,15 @@ export default function SettingsPanel({ open, darkMode, themeMode, sunInfo, init
   const [restoreFile, setRestoreFile] = useState<File | null>(null)
   const [isRestoring, setIsRestoring] = useState(false)
   const restoreFileInputRef = useRef<HTMLInputElement | null>(null)
+
+  // 文献互通（导入 / 导出）state
+  const [interopFormat, setInteropFormat] = useState<InteropFormat>('csljson')
+  const [interopSkipDuplicates, setInteropSkipDuplicates] = useState(true)
+  const [isImportingRefs, setIsImportingRefs] = useState(false)
+  const [isExportingRefs, setIsExportingRefs] = useState(false)
+  const [interopResult, setInteropResult] = useState<InteropImportResult | null>(null)
+  const [interopFeedback, setInteropFeedback] = useState<{ kind: 'success' | 'error' | 'info'; message: string } | null>(null)
+  const interopFileInputRef = useRef<HTMLInputElement | null>(null)
 
   useEffect(() => {
     if (!open) return
@@ -356,6 +382,49 @@ export default function SettingsPanel({ open, darkMode, themeMode, sunInfo, init
       showBackupFeedback('error', `恢复失败：${message}`, true)
     } finally {
       setIsRestoring(false)
+    }
+  }
+
+  // ===== 文献互通（导入 / 导出）=====
+
+  const showInteropFeedback = (kind: 'success' | 'error' | 'info', message: string) => {
+    setInteropFeedback({ kind, message })
+  }
+
+  const handleInteropFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0]
+    e.target.value = ''
+    if (!file || isImportingRefs) return
+    setIsImportingRefs(true)
+    setInteropFeedback(null)
+    setInteropResult(null)
+    try {
+      const result = await importReferences(file, { skipDuplicates: interopSkipDuplicates })
+      setInteropResult(result)
+      showInteropFeedback(
+        result.failed > 0 ? 'error' : 'success',
+        `导入完成：新增 ${result.imported} 篇，跳过 ${result.skipped} 篇，失败 ${result.failed} 篇。`,
+      )
+    } catch (err) {
+      const message = err instanceof Error ? err.message : '导入失败'
+      showInteropFeedback('error', `导入失败：${message}`)
+    } finally {
+      setIsImportingRefs(false)
+    }
+  }
+
+  const handleInteropExport = async () => {
+    if (isExportingRefs) return
+    setIsExportingRefs(true)
+    setInteropFeedback(null)
+    try {
+      await downloadReferences(interopFormat)
+      showInteropFeedback('success', `已导出为 ${interopFormat.toUpperCase()} 文件。`)
+    } catch (err) {
+      const message = err instanceof Error ? err.message : '导出失败'
+      showInteropFeedback('error', `导出失败：${message}`)
+    } finally {
+      setIsExportingRefs(false)
     }
   }
 
@@ -1341,6 +1410,158 @@ export default function SettingsPanel({ open, darkMode, themeMode, sunInfo, init
                     </div>
                   </>
                 )}
+              </div>
+            )}
+
+            {activeId === 'interop' && (
+              <div className="settings-group">
+                <h3>导入 / 导出</h3>
+                <p className="settings-group-desc">
+                  与 Zotero、Mendeley、EndNote、JabRef 等文献管理工具互通，支持 CSL JSON、BibTeX、RIS 三种通用格式。
+                </p>
+
+                {interopFeedback && (
+                  <div className={`backup-feedback backup-feedback-${interopFeedback.kind}`}>
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                      {interopFeedback.kind === 'success' ? (
+                        <polyline points="20 6 9 17 4 12" />
+                      ) : (
+                        <>
+                          <circle cx="12" cy="12" r="10" />
+                          <line x1="12" y1="8" x2="12" y2="12" />
+                          <line x1="12" y1="16" x2="12.01" y2="16" />
+                        </>
+                      )}
+                    </svg>
+                    <span>{interopFeedback.message}</span>
+                  </div>
+                )}
+
+                <div className="backup-card">
+                  <div className="backup-card-header">
+                    <div className="backup-card-icon backup-card-icon-papers">
+                      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                        <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+                        <polyline points="7 10 12 15 17 10" />
+                        <line x1="12" y1="15" x2="12" y2="3" />
+                      </svg>
+                    </div>
+                    <div className="backup-card-info">
+                      <span className="backup-card-title">导入文献</span>
+                      <span className="backup-card-desc">
+                        上传从其他工具导出的文件（.json / .bib / .ris），格式会自动识别。导入的文献仅含题录信息，不含 PDF。
+                      </span>
+                      <label className="interop-checkbox">
+                        <input
+                          type="checkbox"
+                          checked={interopSkipDuplicates}
+                          onChange={(e) => setInteropSkipDuplicates(e.target.checked)}
+                        />
+                        <span>跳过库中已存在的文献（按 DOI / 标题判断）</span>
+                      </label>
+                    </div>
+                    <button
+                      type="button"
+                      className="backup-action-btn backup-action-btn-primary"
+                      onClick={() => interopFileInputRef.current?.click()}
+                      disabled={isImportingRefs}
+                    >
+                      {isImportingRefs ? (
+                        <>
+                          <span className="api-spinner small" />
+                          <span>导入中...</span>
+                        </>
+                      ) : (
+                        <>
+                          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+                            <polyline points="7 10 12 15 17 10" />
+                            <line x1="12" y1="15" x2="12" y2="3" />
+                          </svg>
+                          <span>选择文件</span>
+                        </>
+                      )}
+                    </button>
+                    <input
+                      ref={interopFileInputRef}
+                      type="file"
+                      accept=".json,.bib,.bibtex,.ris,.txt"
+                      style={{ display: 'none' }}
+                      onChange={handleInteropFileChange}
+                    />
+                  </div>
+
+                  {interopResult && interopResult.items.length > 0 && (
+                    <div className="interop-result-list">
+                      {interopResult.items.slice(0, 50).map((item, idx) => (
+                        <div key={idx} className={`interop-result-item interop-result-${item.status}`}>
+                          <span className="interop-result-title">{item.title || '（无标题）'}</span>
+                          <span className="interop-result-status">
+                            {item.status === 'imported' ? '已导入' : item.status === 'skipped' ? '已跳过' : `失败：${item.error}`}
+                          </span>
+                        </div>
+                      ))}
+                      {interopResult.items.length > 50 && (
+                        <div className="interop-result-more">…另有 {interopResult.items.length - 50} 条未显示</div>
+                      )}
+                    </div>
+                  )}
+                </div>
+
+                <div className="backup-card">
+                  <div className="backup-card-header">
+                    <div className="backup-card-icon backup-card-icon-full">
+                      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                        <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+                        <polyline points="7 10 12 15 17 10" />
+                        <line x1="12" y1="15" x2="12" y2="3" />
+                      </svg>
+                    </div>
+                    <div className="backup-card-info">
+                      <span className="backup-card-title">导出文献库</span>
+                      <span className="backup-card-desc">
+                        导出全部文献的题录（标题、作者、年份、摘要、DOI、关键词、标签）。CSL JSON 可完整保留中英文标题与文件夹信息。
+                      </span>
+                      <div className="api-subtabs" role="tablist" aria-label="导出格式">
+                        {INTEROP_FORMATS.map((f) => (
+                          <button
+                            key={f.id}
+                            type="button"
+                            role="tab"
+                            aria-selected={interopFormat === f.id}
+                            className={`api-subtab-btn ${interopFormat === f.id ? 'active' : ''}`}
+                            onClick={() => setInteropFormat(f.id)}
+                          >
+                            {f.label}
+                          </button>
+                        ))}
+                      </div>
+                      <span className="backup-card-meta">{INTEROP_FORMATS.find((f) => f.id === interopFormat)?.hint}</span>
+                    </div>
+                    <button
+                      type="button"
+                      className="backup-action-btn backup-action-btn-primary"
+                      onClick={handleInteropExport}
+                      disabled={isExportingRefs}
+                    >
+                      {isExportingRefs ? (
+                        <>
+                          <span className="api-spinner small" />
+                          <span>导出中...</span>
+                        </>
+                      ) : (
+                        <>
+                          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+                            <polyline points="7 10 12 15 17 10" />
+                            <line x1="12" y1="15" x2="12" y2="3" />
+                          </svg>
+                          <span>导出</span>
+                        </>
+                      )}
+                    </button>
+                  </div>
+                </div>
               </div>
             )}
 

@@ -14,10 +14,12 @@ import logging
 from typing import AsyncGenerator, List, Optional
 
 from fastapi import APIRouter, HTTPException
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from app.core.chat_client import ChatClientError, stream_chat
+from app.services.paper_service import get_paper
 from app.services.chat_service import (
     add_message,
     build_chat_messages,
@@ -75,6 +77,10 @@ def create_session_api(payload: CreateSessionRequest) -> dict:
     Returns:
         Session dict.
     """
+    # 校验论文存在：否则会撞外键约束抛 IntegrityError（500），
+    # 与其他端点保持一致返回 404。
+    if get_paper(payload.paper_id) is None:
+        raise HTTPException(status_code=404, detail="Paper not found")
     session = create_session(payload.paper_id, payload.title)
     return session
 
@@ -179,7 +185,9 @@ async def stream_chat_message_api(
     Returns:
         StreamingResponse with SSE events.
     """
-    session_data = get_session(session_id)
+    # 下列数据库读写与上下文构建都是阻塞操作：下沉到线程池执行，
+    # 避免阻塞事件循环（否则会卡住其他请求与正在进行的 SSE 流）。
+    session_data = await run_in_threadpool(get_session, session_id)
     if not session_data:
         raise HTTPException(status_code=404, detail="Chat session not found")
 
@@ -192,7 +200,8 @@ async def stream_chat_message_api(
         user_citations = [{"section": None, "page": None,
                            "quote": payload.selected_text.strip(),
                            "_type": "selected_text"}]
-    user_msg = add_message(
+    user_msg = await run_in_threadpool(
+        add_message,
         session_id=session_id,
         role="user",
         content=payload.message,
@@ -215,20 +224,21 @@ async def stream_chat_message_api(
     # If editing, remove the old message and its assistant response from history
     if payload.edit_message_id:
         # Soft-delete the old user message
-        soft_delete_message(payload.edit_message_id)
+        await run_in_threadpool(soft_delete_message, payload.edit_message_id)
         # Also soft-delete the assistant response that follows it
         # (find the assistant message after this user message)
         msgs = session_data["messages"]
         found = False
         for m in msgs:
             if found and m["role"] == "assistant":
-                soft_delete_message(m["id"])
+                await run_in_threadpool(soft_delete_message, m["id"])
                 break
             if m["id"] == payload.edit_message_id:
                 found = True
 
     # Build the full messages for the LLM
-    messages = build_chat_messages(
+    messages = await run_in_threadpool(
+        build_chat_messages,
         paper_id=paper_id,
         conversation_history=history,
         user_message=payload.message,
@@ -255,7 +265,8 @@ async def stream_chat_message_api(
         # Save the assistant response BEFORE the done event so the frontend's
         # follow-up getChatSession() call reliably sees the persisted message.
         if assistant_content:
-            add_message(
+            await run_in_threadpool(
+                add_message,
                 session_id=session_id,
                 role="assistant",
                 content=assistant_content,

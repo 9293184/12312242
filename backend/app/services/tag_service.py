@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 import re
+import sqlite3
 from uuid import uuid4
 
 from app.db import session
@@ -109,6 +110,12 @@ def create_tag(payload: TagCreate) -> TagResponse:
     name = _normalize_and_validate_name(payload.name)
     color = _validate_color(payload.color)
     with session() as conn:
+        # 先取写锁再查：避免并发创建同名标签时两个请求都查不到、各插一条。
+        # （tags.name 没有唯一约束，唯一性由服务层的大小写不敏感查重保证。）
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+        except sqlite3.OperationalError:
+            pass
         # Case-insensitive dedup so 'Deep Learning' reuses 'deep learning'.
         existing = conn.execute(
             "SELECT * FROM tags WHERE LOWER(name) = LOWER(?)", (name,)

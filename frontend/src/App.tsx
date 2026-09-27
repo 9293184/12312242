@@ -48,6 +48,8 @@ import {
   type SunInfo,
   type WeatherInfo,
 } from './themeUtils'
+import { isAnalyzingStatus } from './utils/paperStatus'
+import { parsePoemTable } from './utils/poems'
 
 // 使用 BASE_URL 前缀,确保 file:// 协议下也能正确解析到 dist 目录下的资源
 const logoUrl = `${import.meta.env.BASE_URL}icon.png`
@@ -55,6 +57,14 @@ const darkLogoUrl = `${import.meta.env.BASE_URL}darkicon.png`
 
 // 新手教程localStorage键：标记用户是否已完成首次启动教程
 const ONBOARDING_STORAGE_KEY = 'paperreading_onboarding_completed'
+
+// 论文列表签名：只要「会影响侧边栏展示」的字段没变，就认为列表未变化，
+// 从而跳过重复的 setState 与整棵侧边栏重渲染。
+function papersSignature(list: Paper[]): string {
+  return list
+    .map((p) => `${p.id}|${p.status}|${p.updated_at}|${p.title}|${p.folder_id ?? ''}`)
+    .join('\n')
+}
 
 function usePageBranding(isDark: boolean) {
   useEffect(() => {
@@ -81,7 +91,6 @@ function MainLayout({
   themeMode,
   sunInfo,
   weatherInfo,
-  nowTick,
   onNavigate,
   onToggleSidebar,
   onSidebarWidthChange,
@@ -112,7 +121,6 @@ function MainLayout({
   themeMode: ThemeMode
   sunInfo: SunInfo | null
   weatherInfo: WeatherInfo | null
-  nowTick: number
   onNavigate: (id: string) => void
   onToggleSidebar: () => void
   onSidebarWidthChange: (width: number) => void
@@ -146,7 +154,6 @@ function MainLayout({
         themeMode={themeMode}
         sunInfo={sunInfo}
         weatherInfo={weatherInfo}
-        nowTick={nowTick}
         onNavigate={onNavigate}
         onToggleSidebar={onToggleSidebar}
         onEdit={onEdit}
@@ -187,23 +194,6 @@ interface HomePoem {
   author: string
 }
 
-function parseHomePoems(markdown: string): HomePoem[] {
-  const lines = markdown.split('\n').filter((l) => l.trim())
-  const poems: HomePoem[] = []
-  for (const line of lines) {
-    if (!line.startsWith('|') || line.includes(':---') || line.includes('诗句')) continue
-    const parts = line.split('|').map((p) => p.trim()).filter(Boolean)
-    if (parts.length >= 3) {
-      poems.push({
-        verse: parts[0].replace(/\s+/g, ' ').trim(),
-        source: parts[1] || '',
-        author: parts[2] || '',
-      })
-    }
-  }
-  return poems
-}
-
 function HomePage({ papers, personalizedHome, isDarkMode }: { papers: Paper[]; personalizedHome: boolean; isDarkMode: boolean }) {
   const [homePoem, setHomePoem] = useState<HomePoem | null>(null)
 
@@ -214,7 +204,7 @@ function HomePage({ papers, personalizedHome, isDarkMode }: { papers: Paper[]; p
         const res = await fetch(`${import.meta.env.BASE_URL}poem.md`)
         if (!res.ok) return
         const text = await res.text()
-        const parsed = parseHomePoems(text)
+        const parsed = parsePoemTable(text)
         if (parsed.length > 0 && !cancelled) {
           const picked = parsed[Math.floor(Math.random() * parsed.length)]
           setHomePoem(picked)
@@ -305,6 +295,8 @@ function PaperDetailRoute({
   const [message, setMessage] = useState('')
   const messageTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const prevStatusRef = useRef<{ metadata: string; analysis: string; paper: string } | null>(null)
+  // 刷新请求序号：只采纳最新一次刷新结果，避免轮询/上传后的慢响应覆盖新数据
+  const refreshSeqRef = useRef(0)
 
   const showMessage = (msg: string) => {
     setMessage(msg)
@@ -318,15 +310,18 @@ function PaperDetailRoute({
 
   async function refresh(pId: string) {
     if (!pId) return
+    const seq = ++refreshSeqRef.current
     setLoading(true)
     setMessage('')
     try {
       const data = await listPaperDetail(pId)
+      if (seq !== refreshSeqRef.current) return
       setDetail(data)
     } catch (error) {
+      if (seq !== refreshSeqRef.current) return
       showMessage(error instanceof Error ? error.message : '加载失败')
     } finally {
-      setLoading(false)
+      if (seq === refreshSeqRef.current) setLoading(false)
     }
   }
 
@@ -472,7 +467,6 @@ export default function App() {
   const [autoTick, setAutoTick] = useState(0)
   const [sunInfo, setSunInfo] = useState<SunInfo | null>(null)
   const [weatherInfo, setWeatherInfo] = useState<WeatherInfo | null>(null)
-  const [nowTick, setNowTick] = useState(() => Date.now())
   const [settingsPanelOpen, setSettingsPanelOpen] = useState(false)
   const [settingsInitialSection, setSettingsInitialSection] = useState<string>('appearance')
   const messageTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
@@ -582,6 +576,8 @@ export default function App() {
   // Track papers whose duplicate dialog has been resolved (confirmed or cancelled)
   // to prevent re-opening while the backend thread updates the status
   const duplicateResolvedRef = useRef<Set<string>>(new Set())
+  // 论文列表签名：用于跳过「数据未变化」的重复 setState
+  const papersSigRef = useRef('')
 
   const currentPaperId = useMemo(() => {
     const match = location.pathname.match(/^\/papers\/(.+)$/)
@@ -603,9 +599,18 @@ export default function App() {
   async function refreshList() {
     try {
       const data = await listPapers()
-      setPapers(data)
+      // 数据未变化时不 setState：轮询/路由切换会频繁调用本函数，
+      // 每次都写入新数组会让整个侧边栏（含论文列表）无谓重渲染。
+      const sig = papersSignature(data)
+      if (sig !== papersSigRef.current) {
+        papersSigRef.current = sig
+        setPapers(data)
+      }
     } catch {
-      setPapers([])
+      if (papersSigRef.current !== '') {
+        papersSigRef.current = ''
+        setPapers([])
+      }
     }
   }
 
@@ -636,8 +641,7 @@ export default function App() {
   // Ensures sidebar statuses stay up-to-date even when viewing a different
   // paper than the one currently being processed.
   useEffect(() => {
-    const ANALYZING_STATUSES = ['uploaded', 'mineru_processing', 'mineru_converted', 'ocr_fallback', 'text_extracting', 'metadata_extracting', 'analyzing', 'parsed', 'duplicate_detected']
-    const hasAnalyzingPapers = papers.some(p => ANALYZING_STATUSES.includes(p.status))
+    const hasAnalyzingPapers = papers.some(p => isAnalyzingStatus(p.status))
     if (!hasAnalyzingPapers) return
 
     const timer = window.setInterval(() => {
@@ -881,12 +885,6 @@ export default function App() {
     return () => { mounted = false }
   }, [])
 
-  // 全局时钟：每 1 秒触发一次，用于侧边栏当前时间显示
-  useEffect(() => {
-    const timer = setInterval(() => setNowTick(Date.now()), 1000)
-    return () => clearInterval(timer)
-  }, [])
-
   // 自动模式：每分钟轮询
   // - 触发 isDark 重算（仅读缓存，无 API 调用）
   // - 检测本地日期变化时才触发 API 刷新（每天最多 1 次）
@@ -1054,7 +1052,6 @@ export default function App() {
             themeMode={themeMode}
             sunInfo={sunInfo}
             weatherInfo={weatherInfo}
-            nowTick={nowTick}
             onNavigate={handleNavigate}
             onToggleSidebar={() => setSidebarCollapsed((prev) => !prev)}
             onSidebarWidthChange={setSidebarWidth}

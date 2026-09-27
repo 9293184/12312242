@@ -342,12 +342,21 @@ def _get_paper_full_text(paper_id: str) -> str:
         Full text content, or empty string if not available.
     """
     with session() as conn:
+        # 按明确的作用域优先级取全文：'metadata' 行只存题录（标题/摘要），
+        # 不能当全文用。此前按 updated_at 排序会让「改一次元数据」把
+        # metadata 行顶到最前，导致问答上下文静默降级成摘要。
         row = conn.execute(
             """
-            SELECT raw_text, body_extracted, extraction_method
+            SELECT raw_text, body_extracted
             FROM paper_texts
             WHERE paper_id = ?
-            ORDER BY updated_at DESC
+              AND text_scope IN ('mineru', 'analysis', 'full')
+            ORDER BY CASE text_scope
+                         WHEN 'mineru' THEN 0
+                         WHEN 'analysis' THEN 1
+                         ELSE 2
+                     END,
+                     updated_at DESC
             LIMIT 1
             """,
             (paper_id,),

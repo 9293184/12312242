@@ -7,6 +7,8 @@ the depth constraint and parent existence to keep the tree consistent.
 from __future__ import annotations
 
 import logging
+import tempfile
+from pathlib import Path
 from uuid import uuid4
 
 from app.db import session
@@ -420,40 +422,36 @@ def batch_remove_papers_from_folder(paper_ids: list[str]) -> dict:
     }
 
 
-def batch_import_papers(folder_id: str | None, files: list[tuple[str, bytes]]) -> list[dict]:
-    """Create papers for a list of (filename, bytes) PDFs and assign to a folder.
+def batch_import_files(folder_id: str | None, files: list[tuple[str, Path]]) -> list[dict]:
+    """按「已落盘文件」批量导入，逐个处理，避免把全部文件读进内存。
 
     Each file is stored as the 'original' attachment and triggers background
     analysis (same as the single-upload flow). Returns a per-file result list.
 
     Args:
         folder_id: Target folder ID, or None for no folder.
-        files: List of (filename, file_bytes) tuples.
+        files: List of (filename, source_path) tuples; the source files are
+            deleted after their background analysis finishes (or on failure).
 
     Returns:
         List of dicts: {filename, paper_id, success, error}
     """
-    from pathlib import Path
-
-    from app.services import auto_parse_and_analyze, create_paper, ensure_analysis_placeholder, upsert_attachment_file
+    from app.services import create_paper, ensure_analysis_placeholder, run_analysis_exclusive, upsert_attachment_file
     from app.models import PaperCreate
     from threading import Thread
 
     results: list[dict] = []
-    temp_dir = Path("/tmp") / "paperreading"
-    temp_dir.mkdir(parents=True, exist_ok=True)
 
-    for filename, file_bytes in files:
+    for filename, src_path in files:
         result: dict = {"filename": filename, "paper_id": "", "success": False, "error": ""}
         try:
             if not filename.lower().endswith(".pdf"):
                 raise ValueError("仅支持 PDF 文件")
-            if not file_bytes:
+            if not src_path.exists() or src_path.stat().st_size == 0:
                 raise ValueError("文件为空")
 
             paper_title = Path(filename).stem
-            paper = create_paper(PaperCreate(title=paper_title, status="uploaded"))
-            paper_id = paper.id if hasattr(paper, "id") else paper["id"]
+            paper_id = create_paper(PaperCreate(title=paper_title, status="uploaded"))
 
             # Assign to folder
             if folder_id:
@@ -463,27 +461,26 @@ def batch_import_papers(folder_id: str | None, files: list[tuple[str, bytes]]) -
                         (folder_id, paper_id),
                     )
 
-            # Write temp file and store attachment (triggers analysis)
-            temp_path = temp_dir / f"{paper_id}_{filename}"
-            temp_path.write_bytes(file_bytes)
             ensure_analysis_placeholder(paper_id)
-            upsert_attachment_file(paper_id, "original", str(temp_path), filename)
+            upsert_attachment_file(paper_id, "original", str(src_path), filename)
 
             # Background analysis
             def worker(pid: str, path: str) -> None:
                 try:
-                    auto_parse_and_analyze(pid, path)
+                    run_analysis_exclusive(pid, path)
                 except Exception:
                     logger.exception("batch_import background analysis failed paper_id=%s", pid)
                 finally:
                     Path(path).unlink(missing_ok=True)
 
-            Thread(target=worker, args=(paper_id, str(temp_path)), daemon=True).start()
+            Thread(target=worker, args=(paper_id, str(src_path)), daemon=True).start()
 
             result["paper_id"] = paper_id
             result["success"] = True
         except Exception as exc:
             result["error"] = str(exc)[:200]
+            # 失败时立即清理临时文件，避免堆积
+            Path(src_path).unlink(missing_ok=True)
             logger.warning("batch_import_file_failed filename=%s error=%s", filename, exc)
         results.append(result)
 
@@ -494,3 +491,19 @@ def batch_import_papers(folder_id: str | None, files: list[tuple[str, bytes]]) -
         sum(1 for r in results if not r["success"]),
     )
     return results
+
+
+def batch_import_papers(folder_id: str | None, files: list[tuple[str, bytes]]) -> list[dict]:
+    """兼容入口：把内存中的字节写入临时文件后委托给 ``batch_import_files``。
+
+    新代码（上传接口）应直接使用 ``batch_import_files``，以免把全部文件
+    同时读进内存。
+    """
+    temp_dir = Path(tempfile.gettempdir()) / "paperreading"
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    staged: list[tuple[str, Path]] = []
+    for filename, file_bytes in files:
+        temp_path = temp_dir / f"{uuid4().hex}_{filename}"
+        temp_path.write_bytes(file_bytes)
+        staged.append((filename, temp_path))
+    return batch_import_files(folder_id, staged)

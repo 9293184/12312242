@@ -16,6 +16,7 @@ import {
 import { COLLAPSED_WIDTH } from './SidebarResizer'
 import SettingsDrawer from './SettingsDrawer'
 import type { ThemeMode, SunInfo, WeatherInfo } from '../themeUtils'
+import { isAnalyzingStatus } from '../utils/paperStatus'
 import { weatherIconToEmoji } from '../themeUtils'
 
 // 使用 BASE_URL 前缀,确保 file:// 协议下也能正确解析到 dist 目录下的资源
@@ -196,11 +197,9 @@ function formatLunarFull(date: Date): string {
  */
 function ClockWeatherCard({
   weatherInfo,
-  nowTick,
   onRefreshWeather,
 }: {
   weatherInfo: WeatherInfo | null
-  nowTick: number
   onRefreshWeather: () => void
 }) {
   const [expanded, setExpanded] = useState(false)
@@ -208,6 +207,14 @@ function ClockWeatherCard({
   const [refreshing, setRefreshing] = useState(false)
   const cardRef = useRef<HTMLButtonElement | null>(null)
   const popupRef = useRef<HTMLDivElement | null>(null)
+  // 时钟状态放在本组件内部：此前由 App 每秒 setState 驱动，
+  // 会导致整个侧边栏（含论文列表）每秒重渲染一次。
+  const [nowTick, setNowTick] = useState(() => Date.now())
+
+  useEffect(() => {
+    const timer = setInterval(() => setNowTick(Date.now()), 1000)
+    return () => clearInterval(timer)
+  }, [])
 
   const now = new Date(nowTick)
   const hh = String(now.getHours()).padStart(2, '0')
@@ -395,7 +402,6 @@ type SidebarProps = {
   themeMode: ThemeMode
   sunInfo: SunInfo | null
   weatherInfo: WeatherInfo | null
-  nowTick: number
   onNavigate: (id: string) => void
   onToggleSidebar: () => void
   onEdit: () => void
@@ -429,7 +435,6 @@ export default function Sidebar({
   themeMode,
   sunInfo,
   weatherInfo,
-  nowTick,
   onNavigate,
   onToggleSidebar,
   onEdit,
@@ -875,7 +880,20 @@ export default function Sidebar({
 
   useEffect(() => {
     return () => {
-      if (showTextTimeoutRef.current) clearTimeout(showTextTimeoutRef.current)
+      // 卸载时清理所有未触发的定时器，避免在已卸载组件上 setState
+      for (const ref of [
+        showTextTimeoutRef,
+        scrollTimeoutRef,
+        tooltipHideTimeoutRef,
+        tooltipShowTimeoutRef,
+        folderHideTimeoutRef,
+        tagHideTimeoutRef,
+      ]) {
+        if (ref.current) {
+          clearTimeout(ref.current)
+          ref.current = null
+        }
+      }
     }
   }, [])
 
@@ -1090,7 +1108,7 @@ export default function Sidebar({
               {filteredPapers.map((paper) => {
                 const primaryTitle = paper.title || paper.title_cn || paper.title_en || 'Untitled Paper'
                 const secondaryTitle = paper.title_en && paper.title_cn ? (paper.title === paper.title_en ? paper.title_cn : paper.title_en) : ''
-                const isAnalyzingPaper = ['uploaded', 'mineru_processing', 'mineru_converted', 'ocr_fallback', 'text_extracting', 'metadata_extracting', 'analyzing', 'parsed', 'duplicate_detected'].includes(paper.status)
+                const isAnalyzingPaper = isAnalyzingStatus(paper.status)
                 const analyzingLabel: Record<string, string> = {
                   'uploaded': '等待解析',
                   'mineru_processing': 'MinerU 解析中',
@@ -1406,7 +1424,6 @@ export default function Sidebar({
             {showExpandedText && (
               <ClockWeatherCard
                 weatherInfo={weatherInfo}
-                nowTick={nowTick}
                 onRefreshWeather={onRefreshWeather}
               />
             )}

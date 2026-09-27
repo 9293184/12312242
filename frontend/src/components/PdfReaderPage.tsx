@@ -1059,12 +1059,16 @@ export default function PdfReaderPage() {
 
   // ===== Sidebar resize handler =====
   const sidebarRef = useRef<HTMLElement>(null)
+  // 用 ref 记录当前高度，让 onUp 能读到最新值；监听只挂载一次，
+  // 不再随高度变化每帧重新挂载 window 监听。
+  const sidebarTocHeightRef = useRef(sidebarTocHeight)
   useEffect(() => {
     const onMove = (e: MouseEvent) => {
       if (!sidebarResizingRef.current || !sidebarRef.current) return
       const rect = sidebarRef.current.getBoundingClientRect()
       const y = e.clientY - rect.top
       const pct = Math.max(15, Math.min(85, (y / rect.height) * 100))
+      sidebarTocHeightRef.current = pct
       setSidebarTocHeight(pct)
     }
     const onUp = () => {
@@ -1072,7 +1076,7 @@ export default function PdfReaderPage() {
         sidebarResizingRef.current = false
         document.body.style.cursor = ''
         document.body.style.userSelect = ''
-        try { localStorage.setItem('reader-toc-height', String(sidebarTocHeight)) } catch {}
+        try { localStorage.setItem('reader-toc-height', String(sidebarTocHeightRef.current)) } catch {}
       }
     }
     window.addEventListener('mousemove', onMove)
@@ -1081,7 +1085,7 @@ export default function PdfReaderPage() {
       window.removeEventListener('mousemove', onMove)
       window.removeEventListener('mouseup', onUp)
     }
-  }, [sidebarTocHeight])
+  }, [])
 
   const startSidebarResize = useCallback((e: React.MouseEvent) => {
     e.preventDefault()
@@ -1095,7 +1099,10 @@ export default function PdfReaderPage() {
   }), [mode, chatOpen, isDark, isEyeCareMode, addHighlight, updateHighlight, deleteHighlight, beginEdit, endEdit, askAI])
   // Keep the module-level holder in sync so HighlightContainer (rendered in
   // a separate React root by the library) always sees the latest handlers.
-  annoHandlersHolder.current = annoHandlers
+  // 放在 effect 中而不是渲染期赋值，避免渲染副作用（并发渲染下不安全）。
+  useEffect(() => {
+    annoHandlersHolder.current = annoHandlers
+  }, [annoHandlers])
 
   // ===== Toolbar handlers =====
   const handlePrevPage = useCallback(() => {

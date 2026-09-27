@@ -228,22 +228,21 @@ def _extract_first_pages_text(pdf_path: Path) -> tuple[str, str, str]:
     except Exception:
         return "", "", ""
 
-    pages: list[str] = []
-    metadata_pages: list[str] = []
-    for index, page in enumerate(doc):
-        if index >= FIRST_PAGES_LIMIT:
-            break
-        text = page.get_text("text") or ""
-        pages.append(text)
-        metadata_pages.append(text)
+    # 用上下文管理器确保文档句柄被关闭：反复分析同一 PDF 时不会泄漏
+    # 文件句柄与原生内存。同时只遍历一次文档。
+    with doc:
+        pages: list[str] = []
+        marked: list[str] = []
+        for index, page in enumerate(doc):
+            if index >= FIRST_PAGES_LIMIT:
+                break
+            text = page.get_text("text") or ""
+            pages.append(text)
+            marked.append(f"[PAGE {index + 1}]\n{_normalize_text(text)}")
 
     first_pages_text = _normalize_text("\n".join(pages))
-    metadata_pages_text = _normalize_text("\n".join(metadata_pages))
-    first_pages_marked_text = "\n\n".join(
-        f"[PAGE {index + 1}]\n{_normalize_text(page.get_text('text') or '')}"
-        for index, page in enumerate(doc)
-        if index < FIRST_PAGES_LIMIT
-    )
+    metadata_pages_text = first_pages_text
+    first_pages_marked_text = "\n\n".join(marked)
     return first_pages_text, metadata_pages_text, first_pages_marked_text
 
 
