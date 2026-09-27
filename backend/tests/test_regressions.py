@@ -202,6 +202,44 @@ class TestFuzzySearchBounds:
         assert _is_fuzzy_match("attention is all you need", "atention") is True
 
 
+class TestInitialSeed:
+    def test_seeds_when_empty_and_only_once(self, temp_workspace):
+        """首次启动写入内置文献；重复调用不会重复插入。"""
+        from app.db.sqlite import seed_initial_data_if_empty
+
+        assert seed_initial_data_if_empty() == 3
+        assert seed_initial_data_if_empty() == 0  # 标记文件已存在
+        with session() as conn:
+            assert conn.execute("SELECT COUNT(*) FROM papers").fetchone()[0] == 3
+
+    def test_seeded_papers_are_metadata_only(self, temp_workspace):
+        """内置文献只有题录、没有 PDF，状态为终态 'imported'。"""
+        from app.db.sqlite import seed_initial_data_if_empty
+        from app.services.paper_service import PAPER_STATUS_IMPORTED
+
+        seed_initial_data_if_empty()
+        with session() as conn:
+            ids = [r["id"] for r in conn.execute("SELECT id FROM papers ORDER BY id")]
+
+        assert len(ids) == 3
+        for pid in ids:
+            detail = get_paper(pid)
+            assert detail is not None
+            assert detail.status == PAPER_STATUS_IMPORTED
+            assert detail.attachments == []
+            assert detail.metadata is not None
+            assert detail.metadata.doi  # 元数据（DOI）已写入
+
+    def test_does_not_seed_when_library_not_empty(self, temp_workspace):
+        """库内已有论文时不插入内置数据（例如从备份恢复后）。"""
+        from app.db.sqlite import seed_initial_data_if_empty
+
+        create_paper(PaperCreate(title="已存在的论文", status="uploaded"))
+        assert seed_initial_data_if_empty() == 0
+        with session() as conn:
+            assert conn.execute("SELECT COUNT(*) FROM papers").fetchone()[0] == 1
+
+
 class TestInteropService:
     def test_import_bibtex_then_export(self, temp_workspace):
         bib = """

@@ -260,6 +260,52 @@ def initialize_database(with_seed: bool = False) -> None:
             conn.executescript(settings.seed_path.read_text(encoding="utf-8"))
 
 
+# 标记文件：记录内置初始文献是否已播种过，避免重复插入
+_SEED_MARKER_NAME = ".initial_seed_applied"
+
+
+def _write_seed_marker(marker: Path) -> None:
+    try:
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text("1", encoding="utf-8")
+    except OSError:
+        logger.warning("seed_marker_write_failed", exc_info=True)
+
+
+def seed_initial_data_if_empty() -> int:
+    """首次启动时写入内置的初始文献（Data/seed.sql）。
+
+    只在「从未播种过」且「库内没有任何论文」时执行，因此：
+    - 不会每次启动重复插入；
+    - 用户清空文献库后重启，内置数据不会又冒出来。
+
+    Returns:
+        实际写入的论文条数（未播种时为 0）。
+    """
+    marker = settings.workspace_dir / _SEED_MARKER_NAME
+    if marker.exists():
+        return 0
+
+    with session() as conn:
+        existing = conn.execute("SELECT COUNT(*) FROM papers").fetchone()[0]
+    if existing:
+        # 已有数据（例如从备份恢复）：只打标记，不插入
+        _write_seed_marker(marker)
+        return 0
+
+    if not settings.seed_path.exists():
+        return 0
+
+    seed_sql = settings.seed_path.read_text(encoding="utf-8")
+    with session() as conn:
+        conn.executescript(seed_sql)
+        count = conn.execute("SELECT COUNT(*) FROM papers").fetchone()[0]
+
+    _write_seed_marker(marker)
+    logger.info("initial_seed_applied papers=%s", count)
+    return count
+
+
 def purge_database_data() -> None:
     """Remove all rows while keeping the schema intact."""
 
