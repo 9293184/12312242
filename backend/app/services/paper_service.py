@@ -43,6 +43,10 @@ PAPER_STATUS_PARSED = "parsed"
 PAPER_STATUS_DONE = "done"
 PAPER_STATUS_FAILED = "failed"
 PAPER_STATUS_DUPLICATE_DETECTED = "duplicate_detected"
+# 仅题录（无 PDF）的终态：由文献导入等「没有附件」的路径写入。
+# 不能复用 'uploaded'，否则前端会一直显示「等待解析/正在分析」，
+# 而实际没有 PDF 可供分析，永远不会有进展。
+PAPER_STATUS_IMPORTED = "imported"
 
 # Duplicate detection thresholds
 DUPLICATE_TITLE_SIMILARITY_THRESHOLD = 0.75

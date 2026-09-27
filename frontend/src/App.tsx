@@ -48,7 +48,7 @@ import {
   type SunInfo,
   type WeatherInfo,
 } from './themeUtils'
-import { isAnalyzingStatus } from './utils/paperStatus'
+import { isAnalyzingStatus, isTerminalStatus } from './utils/paperStatus'
 import { parsePoemTable } from './utils/poems'
 
 // 使用 BASE_URL 前缀,确保 file:// 协议下也能正确解析到 dist 目录下的资源
@@ -222,10 +222,10 @@ function HomePage({ papers, personalizedHome, isDarkMode }: { papers: Paper[]; p
     return <PersonalizedHome isDarkMode={isDarkMode} />
   }
 
-  // 后端论文状态机终态为 'done' / 'failed'(见 backend PAPER_STATUS_DONE/FAILED),
+  // 后端论文状态机终态为 'done' / 'failed' / 'imported'（仅题录），
   // 其余状态(uploaded/mineru_processing/analyzing/duplicate_detected 等)均视为处理中。
   const done = papers.filter((p) => p.status === 'done').length
-  const processing = papers.filter((p) => p.status !== 'done' && p.status !== 'failed').length
+  const processing = papers.filter((p) => !isTerminalStatus(p.status)).length
 
   return (
     <div className="empty-state card empty-hero empty-hero-enhanced">

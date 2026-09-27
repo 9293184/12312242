@@ -412,6 +412,10 @@ def reanalyze_paper_api(paper_id: str, force_mineru_refresh: bool = False) -> di
     if paper is None:
         raise HTTPException(status_code=404, detail="Paper not found")
 
+    # 没有原件就无从分析：明确报错，避免前端一直停在「正在分析」的假进度上
+    if not any(item.attachment_type == "original" for item in paper.attachments):
+        raise HTTPException(status_code=400, detail="该文献没有 PDF 原件，请先上传原件后再分析")
+
     def worker() -> None:
         original = next((item for item in paper.attachments if item.attachment_type == "original"), None)
         if original is None:

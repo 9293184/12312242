@@ -18,13 +18,14 @@ from app.core import ref_formats as rf
 from app.db import session
 from app.models import FolderCreate, PaperCreate, PaperUpdate, TagCreate
 from app.services.folder_service import create_folder
-from app.services.paper_service import create_paper, update_paper
+from app.services.paper_service import PAPER_STATUS_IMPORTED, create_paper, update_paper
 from app.services.tag_service import create_tag, set_paper_tags
 
 logger = logging.getLogger(__name__)
 
-# 导入时论文一律置为 uploaded：不携带分析结果，避免出现「已完成但无分析」的状态
-_IMPORT_STATUS = "uploaded"
+# 导入的论文只有题录、没有 PDF，因此不能置为 'uploaded'：
+# 前端会把 'uploaded' 当作「正在分析」，导致进度条永远停在 0%。
+_IMPORT_STATUS = PAPER_STATUS_IMPORTED
 
 
 # ============================================================================

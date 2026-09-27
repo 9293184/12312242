@@ -269,3 +269,18 @@ class TestInteropService:
         assert detail is not None
         assert detail.title == "预训练模型综述"
         assert detail.title_en == ""
+
+    def test_imported_paper_status_is_terminal_not_analyzing(self, temp_workspace):
+        """回归：导入的论文只有题录、没有 PDF，状态不能是 'uploaded'。
+
+        否则前端会一直显示「等待解析 / 正在分析」，进度永远停在 0%。
+        """
+        from app.services.paper_service import PAPER_STATUS_IMPORTED
+
+        bib = "@article{k1, title={Only Metadata}, author={A, B}, year={2020}}"
+        result = interop_service.import_text(bib, filename="a.bib")
+        detail = get_paper(result["items"][0]["paper_id"])
+        assert detail is not None
+        assert detail.status == PAPER_STATUS_IMPORTED
+        # 没有任何附件 → 不存在可运行的分析
+        assert detail.attachments == []

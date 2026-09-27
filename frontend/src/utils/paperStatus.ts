@@ -22,3 +22,18 @@ const ANALYZING_SET: ReadonlySet<string> = new Set(ANALYZING_STATUSES)
 export function isAnalyzingStatus(status: string): boolean {
   return ANALYZING_SET.has(status)
 }
+
+/**
+ * 论文状态机的终态。
+ *
+ * - `done` / `failed`：分析已完成或失败
+ * - `imported`：仅题录、没有 PDF（如从 Zotero 导入），不存在可运行的分析
+ */
+export const TERMINAL_STATUSES = ['done', 'failed', 'imported'] as const
+
+const TERMINAL_SET: ReadonlySet<string> = new Set(TERMINAL_STATUSES)
+
+/** 该状态是否为终态（不会再变化，也没有正在跑的任务）。 */
+export function isTerminalStatus(status: string): boolean {
+  return TERMINAL_SET.has(status)
+}
