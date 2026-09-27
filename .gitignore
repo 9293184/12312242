@@ -86,3 +86,8 @@ Desktop.ini
 # workspace/ 存放运行时数据：api_config.json(含 API 密钥)、paperreading.db(整库)、
 # 上传的 PDF、debug_logs/task_logs。属于本机私有数据，绝不能提交。
 workspace/
+
+# ===== 临时开发脚本 =====
+# 开发/调试期间用的一次性脚本（验证、诊断、数据修复、提交信息等）统一放这里，
+# 不提交；需要清理时直接删掉整个目录即可。
+.dev-scripts/
